@@ -22,11 +22,17 @@ var migrations embed.FS
 // Migrate applies the migrations that haven't run yet. A Postgres advisory lock keeps two instances
 // starting at once from migrating together.
 func Migrate(ctx context.Context, db *gorm.DB) error {
-	sqlDB, err := db.DB()
+	fsys, err := fs.Sub(migrations, "migrations")
 	if err != nil {
 		return err
 	}
-	fsys, err := fs.Sub(migrations, "migrations")
+	return migrate(ctx, db, fsys)
+}
+
+// migrate applies the goose SQL files in fsys. Tests call it with fixture migrations, since the real
+// ones may not exist yet.
+func migrate(ctx context.Context, db *gorm.DB, fsys fs.FS) error {
+	sqlDB, err := db.DB()
 	if err != nil {
 		return err
 	}
