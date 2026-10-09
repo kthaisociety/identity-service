@@ -10,7 +10,6 @@ skeleton: two listeners, `/health`, the service-secret middleware.
 - Config: `cp .env.example .env`, then fill in the secrets
 - Run: `go run ./cmd/api` (public on `127.0.0.1:8010`, internal on `127.0.0.1:8011` with the example env)
 - Test: `go vet ./... && go test -race ./...`
-- Acceptance tests (ticket branches only): `go test -tags acceptance ./test/acceptance/...`
 - Image: `docker build -t identity-service .`
 
 ## Layout
@@ -19,7 +18,6 @@ skeleton: two listeners, `/health`, the service-secret middleware.
 - `internal/config`: env, validated at boot
 - `internal/handlers`: one router per listener
 - `internal/database`: Postgres connection
-- `test/acceptance`: per-ticket acceptance tests
 
 ## Rules
 
