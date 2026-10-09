@@ -1,4 +1,4 @@
-# 0003. Tests live next to the code and run on every PR
+# 0002. Tests live next to the code and run on every PR
 
 Status: Accepted
 
@@ -15,4 +15,5 @@ code is security code: every rule it enforces (a rejected token, a rejected redi
 that proves it, and keeps proving it.
 
 ## How to apply
-CI runs `go vet ./...` and `go test -race ./...`. Run the same locally before pushing.
+`make test` runs `go vet ./...` and `go test -race ./...`; CI runs the same target. Run it locally before
+pushing.

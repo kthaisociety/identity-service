@@ -9,8 +9,12 @@ and other services manage users and kthais.com Google Workspace accounts through
 ## Start here
 
 1. Read [`CONTEXT.md`](CONTEXT.md) for the vocabulary.
-2. Read the decisions in [`docs/adr/`](docs/adr/). 0001–0005 are decided. 0006–0008 are open, and deciding
-   them is part of the work.
+2. Read the decisions in [`docs/adr/`](docs/adr/). Deciding the open questions below, each in a new ADR,
+   is part of the work:
+   - **OIDC implementation**: how the service speaks OIDC (ADR 0004). Keep it small and readable.
+   - **Sessions**: where the single-sign-on session lives, how long it lasts, how sign-out works.
+   - **Signing keys**: where the private key is kept (OpenBao when deployed) and how it's rotated without
+     signing everyone out of every app at once.
 3. Look at what exists today (below), then design this service from a clean slate.
 
 ### What exists today
@@ -49,17 +53,20 @@ Why two: [ADR 0003](docs/adr/0003-two-listeners.md).
 Needs Go 1.27 and Docker.
 
 ```sh
-docker compose up -d          # Postgres on 127.0.0.1:5435
+docker compose up -d          # Postgres on 127.0.0.1:5437
 cp .env.example .env          # then fill in IDENTITY_SERVICE_SECRET
 go run ./cmd/api
 curl localhost:8010/health
 ```
 
-Tests: `go vet ./... && go test -race ./...`. They never call real Google APIs.
+Tests: `make test` (`go vet ./...` and `go test -race ./...`; database tests need `docker compose up -d`). They never call real Google APIs.
+
+The schema is SQL files in `internal/database/migrations/`, applied by the server at startup
+([PCR 0005](docs/pcr/0005-sql-migrations.md)).
 
 ## Configuration
 
-All from env ([PCR 0002](docs/pcr/0002-config-from-env.md)); see `.env.example`.
+All from env ([PCR 0001](docs/pcr/0001-config-from-env.md)); see `.env.example`.
 
 | Variable | Secret | |
 |---|---|---|

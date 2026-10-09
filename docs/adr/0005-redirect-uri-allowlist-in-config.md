@@ -7,7 +7,7 @@ After sign-in, identity sends the user back to the app with a code. If it redire
 request asks for, any site could receive signed-in users' codes.
 
 ## Decision
-Each app (client) is registered in config, from the environment (PCR 0002): its client ID, its allowed
+Each app (client) is registered in config, from the environment (PCR 0001): its client ID, its allowed
 redirect URIs, and whether it has a backend that can hold a secret. Redirect URIs are an exact-match
 allowlist: no wildcards, no prefix matching.
 
