@@ -20,7 +20,7 @@ type Config struct {
 	InternalPort string
 
 	// DatabaseURL is a Postgres connection string, e.g.
-	// postgres://identity:identity@127.0.0.1:5435/identity?sslmode=disable.
+	// postgres://identity:identity@127.0.0.1:5437/identity?sslmode=disable.
 	DatabaseURL string
 
 	// ServiceSecret is the shared secret callers of the internal API send as X-Service-Secret.
