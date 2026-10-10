@@ -1,4 +1,4 @@
-# 0004. The internal API authenticates callers with a shared secret
+# 0003. The internal API authenticates callers with a shared secret
 
 Status: Accepted
 

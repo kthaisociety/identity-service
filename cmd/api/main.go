@@ -33,6 +33,9 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	if err := database.Migrate(ctx, db); err != nil {
+		log.Fatal(err)
+	}
 
 	deps := handlers.Deps{
 		PingDB:        func(ctx context.Context) error { return database.Ping(ctx, db) },

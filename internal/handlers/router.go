@@ -26,7 +26,7 @@ func NewPublicRouter(d Deps) *gin.Engine {
 }
 
 // NewInternalRouter serves other KTHAIS services on the internal network only. Everything under /v1
-// needs the service secret (docs/pcr/0004).
+// needs the service secret (docs/pcr/0003).
 func NewInternalRouter(d Deps) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Logger(), gin.Recovery())
