@@ -8,6 +8,7 @@ import (
 	"strings"
 )
 
+// The config file is used for providing functionality to extract and validate the environment variables.
 type Config struct {
 	// Host is the bind address for both listeners. Empty binds all interfaces, which the container
 	// needs. Set it to 127.0.0.1 for local dev: a dev machine with a public IP exposes anything bound
