@@ -14,14 +14,17 @@ import (
 
 	"github.com/kthaisociety/identity-service/internal/config"
 	"github.com/kthaisociety/identity-service/internal/database"
+	"github.com/kthaisociety/identity-service/internal/googleauth"
 	"github.com/kthaisociety/identity-service/internal/handlers"
+	"github.com/kthaisociety/identity-service/internal/oidcprovider"
+	"github.com/zitadel/oidc/v3/pkg/op"
 )
 
 func main() {
 	// Best effort: in a container the variables are set directly and there's no .env.
 	_ = godotenv.Load()
 
-	// Loads the config using the strongly typed Config struct
+	// Validate all required settings before starting either listener.
 	cfg := config.Load()
 	if err := cfg.Validate(); err != nil {
 		log.Fatal(err)
@@ -30,29 +33,43 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Open a reference to the DB via Gorm.
+	// Open Postgres and apply the versioned SQL schema.
 	db, err := database.Open(ctx, cfg.DatabaseURL)
 	if err != nil {
 		log.Fatal(err)
 	}
-	// Applies any needed migrations
 	if err := database.Migrate(ctx, db); err != nil {
 		log.Fatal(err)
 	}
-
-	// Dependency injection so that HTTP routers can do their job
-	deps := handlers.Deps{
-		// A function that allows the router check the health of the DB.
-		PingDB: func(ctx context.Context) error { return database.Ping(ctx, db) },
-		// The identity-service secret is added here so that internal routers
-		// can use it to verify it against the incoming X-Service-Secret header on any request to /v1/*
-		ServiceSecret: cfg.ServiceSecret,
+	store, cryptoKey, err := oidcprovider.NewStore(db, cfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+	provider, err := oidcprovider.New(store, cryptoKey, cfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+	google, err := googleauth.New(ctx, cfg.GoogleClientID, cfg.GoogleClientSecret, cfg.GoogleRedirectURI)
+	if err != nil {
+		log.Fatal("discovering Google OIDC provider: ", err)
 	}
 
-	// Two listeners (docs/adr/0003): public sign-in, and the internal API with admin rights.
-	// Starts two independent HTTP servers running at the same in
+	// Both routers share the database but expose different capabilities.
+	deps := handlers.Deps{
+		// Health checks use the same database connection as sign-in.
+		PingDB: func(ctx context.Context) error { return database.Ping(ctx, db) },
+		// Only the internal router uses this secret for /v1 requests.
+		ServiceSecret:   cfg.ServiceSecret,
+		Provider:        provider,
+		AuthStore:       store,
+		Google:          google,
+		AuthCallbackURL: op.AuthCallbackURL(provider),
+		Issuer:          cfg.Issuer,
+	}
+
+	// Two listeners (docs/adr/0003): public sign-in and the internal API.
 	servers := []*http.Server{
-		// The internal router contains the routes for browsers, soon /authorize /token etc.
+		// The public router handles browser sign-in and OIDC endpoints.
 		newServer("public", net.JoinHostPort(cfg.Host, cfg.PublicPort), handlers.NewPublicRouter(deps)),
 		// Internal route is intended for backend services (/v1/*) protected by the secret header.
 		newServer("internal", net.JoinHostPort(cfg.Host, cfg.InternalPort), handlers.NewInternalRouter(deps)),
@@ -74,7 +91,7 @@ func newServer(name, addr string, handler http.Handler) *http.Server {
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	// Runs as a background go routine (thread)
+	// Run each listener until shutdown.
 	go func() {
 		log.Printf("identity-service %s listener on %s", name, addr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

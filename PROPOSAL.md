@@ -58,6 +58,22 @@ CREATE TABLE auth_codes (
 
 *Note: Registered client IDs and exact redirect URIs are configured via environment variables (ADR 0005). The `user_roles` join table is the agreed roles model. The authorization-code table is a sketch; its final shape must fit the chosen OIDC library's storage interface.*
 
+### How the prototype migration differs from this sketch
+
+The SQL above records the original design. The implemented schema is in
+[`internal/database/migrations/00001_identity.sql`](internal/database/migrations/00001_identity.sql):
+
+| Original sketch | Prototype migration | Why |
+|---|---|---|
+| `auth_codes` | `oidc_auth_requests` | ZITADEL's storage interface needs the entire authorization request during code exchange: client and redirect URI, OIDC `state`, `nonce`, scopes, response type/mode, PKCE challenge, user and authentication time. The same row tracks whether login is complete and holds the 60-second, one-use code. We store a hash of the code rather than the code itself. The library requires this state to be available, but does not prescribe this table name or SQL layout. |
+| No Google callback state table | `google_state_hash` on `oidc_auth_requests` | Our Google login needs to match its callback to the pending request. Hashing and consuming that state are our implementation choices, separate from ZITADEL's app-facing OIDC flow. A short-lived browser cookie also binds the callback to the browser that started login. |
+| No refresh-token table | `oidc_refresh_tokens` | Sam chose one-hour access tokens plus refresh. This table stores a hashed refresh token, its user, client, scopes, authentication time and expiry; refresh rotates the token. |
+| SSO cookie described, no table | `oidc_sessions` | A hashed session cookie, user ID, original authentication time and expiry persist SSO across restarts (ADR 0007). |
+| `users`, `user_roles` | Same two tables, with small column differences | Go generates new UUIDs, while imported users can retain their UUIDs. `google_sub` remains nullable. SQL `text` replaces the sketch's `varchar` limits. `user_roles` adds a role check and omits the unused `created_at` column. |
+
+These tables are the provider's protocol and session state, not extra member profile data. The Go structs below are also conceptual sketches; the implemented storage models are in
+[`internal/oidcprovider/models.go`](internal/oidcprovider/models.go).
+
 ---
 
 ## 3. Core Go Structs

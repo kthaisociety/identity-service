@@ -8,11 +8,14 @@ import (
 
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 // Open connects and pings, so a wrong DATABASE_URL fails at boot rather than on the first request.
 func Open(ctx context.Context, url string) (*gorm.DB, error) {
-	db, err := gorm.Open(postgres.Open(url), &gorm.Config{})
+	// SQL parameters may contain Google subjects or email addresses. Callers
+	// handle errors without logging queries or personal data.
+	db, err := gorm.Open(postgres.Open(url), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
 	if err != nil {
 		return nil, fmt.Errorf("opening database: %w", err)
 	}
