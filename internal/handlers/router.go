@@ -4,8 +4,11 @@ package handlers
 import (
 	"context"
 	"crypto/subtle"
+	"errors"
 	"io"
+	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -32,7 +35,7 @@ type Deps struct {
 func NewPublicRouter(d Deps) *gin.Engine {
 	r := gin.New()
 	// Request URLs and headers can contain codes or credentials.
-	r.Use(safeRecovery())
+	r.Use(failureLogging("public"), safeRecovery())
 
 	r.GET("/health", health(d.PingDB))
 	if d.Provider != nil {
@@ -42,10 +45,12 @@ func NewPublicRouter(d Deps) *gin.Engine {
 			// The login UI does not yet implement forced reauthentication or
 			// silent login. Reject these controls instead of silently ignoring them.
 			if c.Request.URL.Query().Has("prompt") || c.Request.URL.Query().Has("max_age") {
+				markFailure(c, "authorization_unsupported")
 				c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "prompt and max_age are not supported"})
 				return
 			}
 			if c.Query("code_challenge") == "" || c.Query("code_challenge_method") != "S256" {
+				markFailure(c, "authorization_pkce_required")
 				c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "PKCE S256 required"})
 				return
 			}
@@ -65,9 +70,77 @@ func NewPublicRouter(d Deps) *gin.Engine {
 }
 
 const (
-	sessionCookie     = "identity_session"
-	googleStateCookie = "identity_google_state"
+	sessionCookie      = "identity_session"
+	googleStateCookie  = "identity_google_state"
+	failureCategoryKey = "failure_category"
 )
+
+// markFailure records only a fixed category. The middleware emits the event
+// after the handler has chosen its response status.
+func markFailure(c *gin.Context, category string) {
+	c.Set(failureCategoryKey, category)
+}
+
+func reject(c *gin.Context, status int, category string) {
+	markFailure(c, category)
+	c.AbortWithStatus(status)
+}
+
+func failureLogging(listener string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Next()
+		status := c.Writer.Status()
+		if status < http.StatusBadRequest && !oidcErrorRedirect(c, status) {
+			return
+		}
+		category, _ := c.Get(failureCategoryKey)
+		name, _ := category.(string)
+		if name == "" {
+			name = providerFailureCategory(c.FullPath())
+		}
+		if name == "" {
+			return
+		}
+		level := slog.LevelWarn
+		if status >= http.StatusInternalServerError {
+			level = slog.LevelError
+		}
+		slog.LogAttrs(c.Request.Context(), level, "sign_in_failed",
+			slog.String("category", name),
+			slog.String("listener", listener),
+			slog.String("route", c.FullPath()),
+			slog.Int("status", status),
+		)
+	}
+}
+
+func oidcErrorRedirect(c *gin.Context, status int) bool {
+	if status < http.StatusMultipleChoices || status >= http.StatusBadRequest || providerFailureCategory(c.FullPath()) == "" {
+		return false
+	}
+	redirect, err := url.Parse(c.Writer.Header().Get("Location"))
+	if err != nil {
+		return false
+	}
+	if redirect.Query().Has("error") {
+		return true
+	}
+	fragment, err := url.ParseQuery(redirect.Fragment)
+	return err == nil && fragment.Has("error")
+}
+
+func providerFailureCategory(route string) string {
+	switch route {
+	case "/authorize":
+		return "authorization_failed"
+	case "/authorize/callback":
+		return "authorization_callback_failed"
+	case "/oauth/token":
+		return "token_exchange_failed"
+	default:
+		return ""
+	}
+}
 
 func identityCookie(d Deps, name, value, path string, maxAge int) *http.Cookie {
 	return &http.Cookie{
@@ -82,13 +155,14 @@ func login(d Deps) gin.HandlerFunc {
 		id := c.Query("authRequestID")
 		request, err := d.AuthStore.AuthRequestByID(c.Request.Context(), id)
 		if err != nil || request.Done() {
+			markFailure(c, "login_request_invalid")
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "invalid login request"})
 			return
 		}
 		if cookie, err := c.Cookie(sessionCookie); err == nil {
 			if userID, authTime, err := d.AuthStore.SessionUser(c.Request.Context(), cookie); err == nil {
 				if err := d.AuthStore.CompleteSessionLogin(c.Request.Context(), id, userID, authTime); err != nil {
-					c.AbortWithStatus(http.StatusInternalServerError)
+					reject(c, http.StatusInternalServerError, "session_store_failed")
 					return
 				}
 				c.Redirect(http.StatusFound, d.AuthCallbackURL(c.Request.Context(), id))
@@ -97,7 +171,7 @@ func login(d Deps) gin.HandlerFunc {
 		}
 		state, err := d.AuthStore.BeginGoogle(c.Request.Context(), id)
 		if err != nil {
-			c.AbortWithStatus(http.StatusInternalServerError)
+			reject(c, http.StatusInternalServerError, "google_state_store_failed")
 			return
 		}
 		http.SetCookie(c.Writer, identityCookie(d, googleStateCookie, state, "/auth/callback", int(oidcprovider.AuthRequestLifetime.Seconds())))
@@ -109,37 +183,41 @@ func googleCallback(d Deps) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		state, code := c.Query("state"), c.Query("code")
 		if state == "" || code == "" {
-			c.AbortWithStatus(http.StatusBadRequest)
+			reject(c, http.StatusBadRequest, "google_callback_invalid")
 			return
 		}
 		browserState, err := c.Cookie(googleStateCookie)
 		if err != nil || subtle.ConstantTimeCompare([]byte(browserState), []byte(state)) != 1 {
-			c.AbortWithStatus(http.StatusBadRequest)
+			reject(c, http.StatusBadRequest, "google_state_mismatch")
 			return
 		}
 		http.SetCookie(c.Writer, identityCookie(d, googleStateCookie, "", "/auth/callback", -1))
 		if _, err := d.AuthStore.RequestIDForGoogleState(c.Request.Context(), state); err != nil {
-			c.AbortWithStatus(http.StatusBadRequest)
+			reject(c, http.StatusBadRequest, "google_state_invalid")
 			return
 		}
 		identity, err := d.Google.Exchange(c.Request.Context(), code)
 		if err != nil {
-			c.AbortWithStatus(http.StatusUnauthorized)
+			reject(c, http.StatusUnauthorized, "google_exchange_failed")
 			return
 		}
 		userID, err := d.AuthStore.FindOrCreateGoogleUser(c.Request.Context(), identity.Subject, identity.Email)
 		if err != nil {
-			c.AbortWithStatus(http.StatusForbidden)
+			category := "user_store_failed"
+			if errors.Is(err, oidcprovider.ErrAccountLinkRequired) {
+				category = "account_link_required"
+			}
+			reject(c, http.StatusForbidden, category)
 			return
 		}
 		id, authTime, err := d.AuthStore.CompleteGoogle(c.Request.Context(), state, userID)
 		if err != nil {
-			c.AbortWithStatus(http.StatusBadRequest)
+			reject(c, http.StatusBadRequest, "google_state_complete_failed")
 			return
 		}
 		value, err := d.AuthStore.CreateSession(c.Request.Context(), userID, authTime)
 		if err != nil {
-			c.AbortWithStatus(http.StatusInternalServerError)
+			reject(c, http.StatusInternalServerError, "session_store_failed")
 			return
 		}
 		http.SetCookie(c.Writer, identityCookie(d, sessionCookie, value, "/", int(oidcprovider.SessionLifetime.Seconds())))
@@ -162,7 +240,7 @@ func endSession(d Deps) gin.HandlerFunc {
 // needs the service secret (docs/pcr/0003).
 func NewInternalRouter(d Deps) *gin.Engine {
 	r := gin.New()
-	r.Use(safeRecovery())
+	r.Use(failureLogging("internal"), safeRecovery())
 
 	r.GET("/health", health(d.PingDB))
 
@@ -177,6 +255,7 @@ func NewInternalRouter(d Deps) *gin.Engine {
 
 func safeRecovery() gin.HandlerFunc {
 	return gin.CustomRecoveryWithWriter(io.Discard, func(c *gin.Context, _ any) {
+		markFailure(c, "panic_recovered")
 		c.AbortWithStatus(http.StatusInternalServerError)
 	})
 }

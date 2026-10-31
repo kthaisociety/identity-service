@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -121,7 +122,7 @@ func (p *prototype) authorize(t *testing.T) (string, string) {
 	return pathFromLocation(t, w), verifier
 }
 
-func (p *prototype) signIn(t *testing.T) (string, *http.Cookie, string) {
+func (p *prototype) beginGoogle(t *testing.T) (string, *http.Cookie, string) {
 	t.Helper()
 	loginPath, verifier := p.authorize(t)
 	login := p.request(http.MethodGet, loginPath, nil, nil, "", "")
@@ -136,14 +137,20 @@ func (p *prototype) signIn(t *testing.T) (string, *http.Cookie, string) {
 	require.True(t, stateCookies[0].HttpOnly)
 	require.Equal(t, "/auth/callback", stateCookies[0].Path)
 	require.Equal(t, http.SameSiteLaxMode, stateCookies[0].SameSite)
+	return state, stateCookies[0], verifier
+}
+
+func (p *prototype) signIn(t *testing.T) (string, *http.Cookie, string) {
+	t.Helper()
+	state, stateCookie, verifier := p.beginGoogle(t)
 	callbackPath := "/auth/callback?state=" + url.QueryEscape(state) + "&code=valid"
 	require.Equal(t, http.StatusBadRequest, p.request(http.MethodGet, callbackPath, nil, nil, "", "").Code)
-	wrongState := *stateCookies[0]
+	wrongState := *stateCookie
 	wrongState.Value = "wrong"
 	require.Equal(t, http.StatusBadRequest, p.request(http.MethodGet, callbackPath, nil, &wrongState, "", "").Code)
-	callback := p.request(http.MethodGet, callbackPath, nil, stateCookies[0], "", "")
+	callback := p.request(http.MethodGet, callbackPath, nil, stateCookie, "", "")
 	require.Equal(t, http.StatusFound, callback.Code, callback.Body.String())
-	require.Equal(t, http.StatusBadRequest, p.request(http.MethodGet, callbackPath, nil, stateCookies[0], "", "").Code)
+	require.Equal(t, http.StatusBadRequest, p.request(http.MethodGet, callbackPath, nil, stateCookie, "", "").Code)
 	cookies := callback.Result().Cookies()
 	var session *http.Cookie
 	for _, cookie := range cookies {
@@ -334,4 +341,62 @@ func TestLogoutWithIDTokenHintEndsSessionAndRefresh(t *testing.T) {
 	require.NotEqual(t, http.StatusOK, p.request(http.MethodPost, "/oauth/token", url.Values{
 		"grant_type": {"refresh_token"}, "refresh_token": {tokens.RefreshToken},
 	}, nil, "app", "secret").Code)
+}
+
+func requireFailureCategory(t *testing.T, logs *bytes.Buffer, category string, secrets ...string) {
+	t.Helper()
+	require.Equal(t, 1, bytes.Count(logs.Bytes(), []byte("category="+category)), logs.String())
+	for _, secret := range secrets {
+		require.NotContains(t, logs.String(), secret)
+	}
+}
+
+func TestSignInFailureLogsContainOnlyCategories(t *testing.T) {
+	t.Run("Google exchange", func(t *testing.T) {
+		logs := captureSafeLogs(t)
+		p := newPrototype(t)
+		state, cookie, _ := p.beginGoogle(t)
+		logs.Reset()
+		path := "/auth/callback?state=" + url.QueryEscape(state) + "&code=code-sentinel&email=person@example.com"
+		w := p.request(http.MethodGet, path, nil, cookie, "", "")
+		require.Equal(t, http.StatusUnauthorized, w.Code)
+		requireFailureCategory(t, logs, "google_exchange_failed", "code-sentinel", "person@example.com", state)
+	})
+
+	t.Run("account link required", func(t *testing.T) {
+		logs := captureSafeLogs(t)
+		p := newPrototype(t)
+		require.NoError(t, p.db.Exec("INSERT INTO users (id, email) VALUES (?, ?)", "00000000-0000-0000-0000-000000000001", "person@example.com").Error)
+		state, cookie, _ := p.beginGoogle(t)
+		logs.Reset()
+		path := "/auth/callback?state=" + url.QueryEscape(state) + "&code=valid"
+		w := p.request(http.MethodGet, path, nil, cookie, "", "")
+		require.Equal(t, http.StatusForbidden, w.Code)
+		requireFailureCategory(t, logs, "account_link_required", "person@example.com", state)
+	})
+
+	t.Run("token exchange", func(t *testing.T) {
+		logs := captureSafeLogs(t)
+		p := newPrototype(t)
+		logs.Reset()
+		w := p.exchange("code-sentinel", "verifier-sentinel", "app", "secret-sentinel", "http://127.0.0.1:8012/callback")
+		require.NotEqual(t, http.StatusOK, w.Code)
+		requireFailureCategory(t, logs, "token_exchange_failed", "code-sentinel", "verifier-sentinel", "secret-sentinel")
+	})
+}
+
+func TestSuccessfulSignInDoesNotLogFailure(t *testing.T) {
+	logs := captureSafeLogs(t)
+	p := newPrototype(t)
+	state, cookie, verifier := p.beginGoogle(t)
+	logs.Reset()
+	callback := p.request(http.MethodGet, "/auth/callback?state="+url.QueryEscape(state)+"&code=valid", nil, cookie, "", "")
+	require.Equal(t, http.StatusFound, callback.Code)
+	issued := p.request(http.MethodGet, pathFromLocation(t, callback), nil, nil, "", "")
+	require.Equal(t, http.StatusFound, issued.Code)
+	appURL, err := url.Parse(issued.Header().Get("Location"))
+	require.NoError(t, err)
+	exchange := p.exchange(appURL.Query().Get("code"), verifier, "app", "secret", "http://127.0.0.1:8012/callback")
+	require.Equal(t, http.StatusOK, exchange.Code, exchange.Body.String())
+	require.NotContains(t, logs.String(), "sign_in_failed")
 }

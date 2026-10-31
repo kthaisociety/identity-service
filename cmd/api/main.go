@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -17,10 +19,15 @@ import (
 	"github.com/kthaisociety/identity-service/internal/googleauth"
 	"github.com/kthaisociety/identity-service/internal/handlers"
 	"github.com/kthaisociety/identity-service/internal/oidcprovider"
+	"github.com/kthaisociety/identity-service/internal/safelog"
 	"github.com/zitadel/oidc/v3/pkg/op"
 )
 
 func main() {
+	// The provider library uses slog.Default for its protocol errors. Keep
+	// those records useful without printing raw error objects or request data.
+	slog.SetDefault(safelog.New(os.Stderr))
+
 	// Best effort: in a container the variables are set directly and there's no .env.
 	_ = godotenv.Load()
 

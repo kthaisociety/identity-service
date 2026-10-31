@@ -101,6 +101,9 @@ including issuer, audience and expiry. Access tokens last one hour; refresh toke
 12 hours. `/end_session` ends that browser session; apps must
 also clear their own sessions. See [`PROPOSAL.md`](PROPOSAL.md) for the rollout and landingpage cookie plan.
 
+Failed sign-ins and recovered panics log a fixed category, listener, route pattern and status for staging
+diagnosis. Request values, personal data, raw errors and panic contents are excluded from these logs.
+
 ## Delivery
 
 Like every KTHAIS app ([infrastructure/docs/app-delivery.md](https://github.com/kthaisociety/infrastructure/blob/main/docs/app-delivery.md)):
