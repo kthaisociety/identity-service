@@ -349,9 +349,38 @@ func requireFailureCategory(t *testing.T, logs *bytes.Buffer, category string, s
 	for _, secret := range secrets {
 		require.NotContains(t, logs.String(), secret)
 	}
+	t.Logf("safe log output:\n%s", strings.TrimSpace(logs.String()))
 }
 
 func TestSignInFailureLogsContainOnlyCategories(t *testing.T) {
+	t.Run("invalid login request", func(t *testing.T) {
+		logs := captureSafeLogs(t)
+		p := newPrototype(t)
+		logs.Reset()
+		w := p.request(http.MethodGet, "/login?authRequestID=request-sentinel", nil, nil, "", "")
+		require.Equal(t, http.StatusBadRequest, w.Code)
+		requireFailureCategory(t, logs, "login_request_invalid", "request-sentinel")
+	})
+
+	t.Run("PKCE required", func(t *testing.T) {
+		logs := captureSafeLogs(t)
+		p := newPrototype(t)
+		logs.Reset()
+		w := p.request(http.MethodGet, "/authorize?code_challenge=challenge-sentinel&code_challenge_method=plain", nil, nil, "", "")
+		require.Equal(t, http.StatusBadRequest, w.Code)
+		requireFailureCategory(t, logs, "authorization_pkce_required", "challenge-sentinel")
+	})
+
+	t.Run("Google state mismatch", func(t *testing.T) {
+		logs := captureSafeLogs(t)
+		p := newPrototype(t)
+		state, _, _ := p.beginGoogle(t)
+		logs.Reset()
+		w := p.request(http.MethodGet, "/auth/callback?state="+url.QueryEscape(state)+"&code=code-sentinel", nil, nil, "", "")
+		require.Equal(t, http.StatusBadRequest, w.Code)
+		requireFailureCategory(t, logs, "google_state_mismatch", "code-sentinel", state)
+	})
+
 	t.Run("Google exchange", func(t *testing.T) {
 		logs := captureSafeLogs(t)
 		p := newPrototype(t)
@@ -399,4 +428,5 @@ func TestSuccessfulSignInDoesNotLogFailure(t *testing.T) {
 	exchange := p.exchange(appURL.Query().Get("code"), verifier, "app", "secret", "http://127.0.0.1:8012/callback")
 	require.Equal(t, http.StatusOK, exchange.Code, exchange.Body.String())
 	require.NotContains(t, logs.String(), "sign_in_failed")
+	t.Log("successful sign-in: no failure log")
 }

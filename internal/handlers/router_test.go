@@ -83,6 +83,7 @@ func TestRecoveredPanicLogsOnlyItsCategory(t *testing.T) {
 	for _, secret := range []string{"panic-secret-sentinel", "code-secret-sentinel", "person@example.com"} {
 		require.NotContains(t, logs.String(), secret)
 	}
+	t.Logf("safe log output:\n%s", logs.String())
 }
 
 func TestOIDCErrorRedirectLogsWithoutItsURL(t *testing.T) {
@@ -100,4 +101,5 @@ func TestOIDCErrorRedirectLogsWithoutItsURL(t *testing.T) {
 	for _, secret := range []string{"state-secret-sentinel", "code-secret-sentinel", "app.example", "access_denied"} {
 		require.NotContains(t, logs.String(), secret)
 	}
+	t.Logf("safe log output:\n%s", logs.String())
 }
