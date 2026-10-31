@@ -34,17 +34,24 @@ CREATE TABLE oidc_auth_requests (
     google_state_hash text UNIQUE
 );
 
+-- App-specific tokens held by various backends to renew access tokens without a browser redirect.
+-- Another app backend (client) holds the refresh token itself. It must present it to identity-service when asking for new tokens.
+-- identity-service (below) stores only a hash of that token, plus the following attributes.
+-- It uses these records to decide whether to accept, revoke or rotate the oken.
 CREATE TABLE oidc_refresh_tokens (
     token_hash text PRIMARY KEY,
     user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    client_id text NOT NULL,
+    client_id text NOT NULL, -- The id of the client app (e.g., landingpage-backend)
     scopes text NOT NULL,
     auth_time timestamptz NOT NULL,
     expires_at timestamptz NOT NULL
 );
 
+-- Stores each oidc session with a sessions expiry date.
+-- oidc sessions let a user sign in to another app without visiting Google again.
+-- The browser holds the cookie actual cookie. Only its hash is stored here.
 CREATE TABLE oidc_sessions (
-    id_hash text PRIMARY KEY,
+    id_hash text PRIMARY KEY, -- Cookie
     user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     auth_time timestamptz NOT NULL,
     expires_at timestamptz NOT NULL

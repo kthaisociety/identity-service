@@ -17,6 +17,8 @@ import (
 )
 
 // Deps holds the services used by the public and internal routers.
+// Provider runs OIDC with apps; AuthStore holds KTHAIS state; Google verifies the person;
+// AuthCallbackURL returns to that protocol after login; Issuer is identity's configured public origin.
 type Deps struct {
 	PingDB        func(ctx context.Context) error
 	ServiceSecret string
@@ -31,7 +33,8 @@ type Deps struct {
 }
 
 // NewPublicRouter serves what browsers and apps reach from the internet: the sign-in flow. Nothing that
-// manages users or holds admin rights belongs here.
+// manages users or holds admin rights belongs here. ZITADEL handles OIDC routes;
+// our handlers identify the user through an existing session or Google.
 func NewPublicRouter(d Deps) *gin.Engine {
 	r := gin.New()
 	// Request URLs and headers can contain codes or credentials.
@@ -39,8 +42,6 @@ func NewPublicRouter(d Deps) *gin.Engine {
 
 	r.GET("/health", health(d.PingDB))
 	if d.Provider != nil {
-		r.GET("/login", login(d))
-		r.GET("/auth/callback", googleCallback(d))
 		r.GET("/authorize", func(c *gin.Context) {
 			// The login UI does not yet implement forced reauthentication or
 			// silent login. Reject these controls instead of silently ignoring them.
@@ -54,9 +55,16 @@ func NewPublicRouter(d Deps) *gin.Engine {
 				c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "PKCE S256 required"})
 				return
 			}
+			// ZITADEL validates and stores the app request through AuthStore. On
+			// success it redirects the browser to /login?authRequestID=...
 			d.Provider.ServeHTTP(c.Writer, c.Request)
 		})
+		r.GET("/login", login(d))
+		r.GET("/auth/callback", googleCallback(d))
+
 		r.GET("/end_session", endSession(d))
+		// These OIDC routes need no identity handler logic; Gin passes each
+		// request to the provider's handler for that path.
 		for _, path := range []string{
 			"/.well-known/openid-configuration", "/authorize/callback", "/oauth/token",
 			"/keys", "/userinfo", "/oauth/introspect", "/revoke",
@@ -81,11 +89,14 @@ func markFailure(c *gin.Context, category string) {
 	c.Set(failureCategoryKey, category)
 }
 
+// reject sends a response and leaves a fixed category for failureLogging.
 func reject(c *gin.Context, status int, category string) {
 	markFailure(c, category)
 	c.AbortWithStatus(status)
 }
 
+// failureLogging emits one category-only record after a failed sign-in route.
+// It also catches OIDC errors returned as redirects instead of HTTP 4xx.
 func failureLogging(listener string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Next()
@@ -114,6 +125,8 @@ func failureLogging(listener string) gin.HandlerFunc {
 	}
 }
 
+// oidcErrorRedirect detects a provider error in a 3xx Location without logging
+// the URL, which may contain codes, state, or other request values.
 func oidcErrorRedirect(c *gin.Context, status int) bool {
 	if status < http.StatusMultipleChoices || status >= http.StatusBadRequest || providerFailureCategory(c.FullPath()) == "" {
 		return false
@@ -129,6 +142,7 @@ func oidcErrorRedirect(c *gin.Context, status int) bool {
 	return err == nil && fragment.Has("error")
 }
 
+// providerFailureCategory maps library-owned routes to fixed log categories.
 func providerFailureCategory(route string) string {
 	switch route {
 	case "/authorize":
@@ -142,6 +156,8 @@ func providerFailureCategory(route string) string {
 	}
 }
 
+// identityCookie applies the browser cookie settings shared by SSO and Google
+// state; production cookies are Secure when the configured issuer uses HTTPS.
 func identityCookie(d Deps, name, value, path string, maxAge int) *http.Cookie {
 	return &http.Cookie{
 		Name: name, Value: value, Path: path, MaxAge: maxAge,
@@ -150,6 +166,11 @@ func identityCookie(d Deps, name, value, path string, maxAge int) *http.Cookie {
 	}
 }
 
+// login resumes the authorization request created by ZITADEL at /authorize.
+// It first rejects unknown, expired, or already-completed requests.
+// An already valid identity session completes the request and returns to ZITADEL's
+// /authorize/callback. Otherwise, it binds a new Google state to this request
+// and browser, then redirects the browser to Google for sign-in.
 func login(d Deps) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		id := c.Query("authRequestID")
@@ -165,6 +186,7 @@ func login(d Deps) gin.HandlerFunc {
 					reject(c, http.StatusInternalServerError, "session_store_failed")
 					return
 				}
+				// The browser returns to ZITADEL to finish this app's request.
 				c.Redirect(http.StatusFound, d.AuthCallbackURL(c.Request.Context(), id))
 				return
 			}
@@ -179,6 +201,11 @@ func login(d Deps) gin.HandlerFunc {
 	}
 }
 
+// googleCallback handles Google's redirect to /auth/callback after sign-in.
+// It checks the browser-bound state, exchanges Google's code, and verifies the
+// returned identity before finding or creating the KTHAIS user. On success it
+// completes the pending authorization request, creates an identity session,
+// and redirects the browser to ZITADEL's /authorize/callback.
 func googleCallback(d Deps) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		state, code := c.Query("state"), c.Query("code")
@@ -196,6 +223,7 @@ func googleCallback(d Deps) gin.HandlerFunc {
 			reject(c, http.StatusBadRequest, "google_state_invalid")
 			return
 		}
+		// This is Google's code; ZITADEL creates the separate app code later.
 		identity, err := d.Google.Exchange(c.Request.Context(), code)
 		if err != nil {
 			reject(c, http.StatusUnauthorized, "google_exchange_failed")
@@ -225,6 +253,8 @@ func googleCallback(d Deps) gin.HandlerFunc {
 	}
 }
 
+// endSession clears our browser session, then lets ZITADEL validate the logout
+// request and redirect to an allowed app or /signed-out.
 func endSession(d Deps) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if value, err := c.Cookie(sessionCookie); err == nil {
@@ -236,8 +266,8 @@ func endSession(d Deps) gin.HandlerFunc {
 	}
 }
 
-// NewInternalRouter serves other KTHAIS services on the internal network only. Everything under /v1
-// needs the service secret (docs/pcr/0003).
+// NewInternalRouter serves other KTHAIS services on the internal network only.
+// /v1 requires the service secret but has no business routes in this prototype.
 func NewInternalRouter(d Deps) *gin.Engine {
 	r := gin.New()
 	r.Use(failureLogging("internal"), safeRecovery())
@@ -253,6 +283,8 @@ func NewInternalRouter(d Deps) *gin.Engine {
 	return r
 }
 
+// safeRecovery returns 500 and records only the panic category; the panic value
+// and stack are discarded because they can contain credentials or user data.
 func safeRecovery() gin.HandlerFunc {
 	return gin.CustomRecoveryWithWriter(io.Discard, func(c *gin.Context, _ any) {
 		markFailure(c, "panic_recovered")
@@ -274,7 +306,7 @@ func requireServiceSecret(secret string) gin.HandlerFunc {
 	}
 }
 
-// Handler, not a middleware. Returns json response to caller.
+// health reports whether the listener can reach Postgres; both listeners use it.
 func health(pingDB func(ctx context.Context) error) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if err := pingDB(c.Request.Context()); err != nil {

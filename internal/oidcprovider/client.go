@@ -26,6 +26,9 @@ func (c client) ResponseTypes() []oidc.ResponseType {
 func (c client) GrantTypes() []oidc.GrantType {
 	return []oidc.GrantType{oidc.GrantTypeCode, oidc.GrantTypeRefreshToken}
 }
+
+// LoginURL tells ZITADEL where to send the browser after /authorize has saved
+// this app's request. Gin handles that later /login request.
 func (c client) LoginURL(id string) string                                { return "/login?authRequestID=" + url.QueryEscape(id) }
 func (c client) AccessTokenType() op.AccessTokenType                      { return op.AccessTokenTypeJWT }
 func (c client) IDTokenLifetime() time.Duration                           { return time.Hour }

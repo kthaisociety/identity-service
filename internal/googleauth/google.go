@@ -24,6 +24,8 @@ type Client struct {
 	httpClient *http.Client
 }
 
+// New discovers Google's OIDC endpoints and prepares the client used by
+// /login and /auth/callback. redirectURI is identity's own Google callback.
 func New(ctx context.Context, clientID, clientSecret, redirectURI string) (*Client, error) {
 	return newClient(ctx, googleIssuer, clientID, clientSecret, redirectURI, http.DefaultClient)
 }
@@ -45,10 +47,13 @@ func newClient(ctx context.Context, issuer, clientID, clientSecret, redirectURI 
 	}, nil
 }
 
+// AuthURL builds the Google sign-in URL with state and identity's configured
+// /auth/callback return URL; /login redirects the browser to it.
 func (c *Client) AuthURL(state string) string { return c.oauth.AuthCodeURL(state) }
 
-// Exchange verifies Google's signature, issuer, audience and expiry before
-// reading identity claims. An unverified email is never accepted.
+// Exchange trades Google's callback code for an ID token, verifies its
+// signature, issuer, audience and expiry, then requires a verified email.
+// Google's code and token are separate from the app's later OIDC code and JWTs.
 func (c *Client) Exchange(ctx context.Context, code string) (Identity, error) {
 	ctx = context.WithValue(ctx, oauth2.HTTPClient, c.httpClient)
 	token, err := c.oauth.Exchange(ctx, code)

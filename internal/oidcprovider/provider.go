@@ -7,7 +7,8 @@ import (
 	"github.com/zitadel/oidc/v3/pkg/op"
 )
 
-// New wires the library's protocol handlers to KTHAIS's durable storage.
+// New wires ZITADEL's OIDC endpoints to our Store. Its HTTP handler is passed
+// to Gin, while our /login and /auth/callback handlers perform Google sign-in.
 func New(store *Store, key [32]byte, cfg *config.Config) (*op.Provider, error) {
 	options := []op.Option{}
 	if strings.HasPrefix(cfg.Issuer, "http://") {

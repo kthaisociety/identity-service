@@ -25,6 +25,8 @@ type userRole struct {
 func (userRole) TableName() string { return "user_roles" }
 
 // authRequest is the durable state behind the library's authorization flow.
+// /authorize creates it, login attaches a user, /authorize/callback saves a
+// code hash, and a successful /oauth/token exchange removes it.
 // Its getters and Done method implement op.AuthRequest; TableName is for GORM.
 type authRequest struct {
 	ID                  string `gorm:"primaryKey"`

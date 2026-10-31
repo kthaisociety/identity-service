@@ -12,8 +12,8 @@ import (
 	"gorm.io/gorm"
 )
 
-// These methods through DeleteAuthRequest implement op.AuthStorage, the library's
-// contract for persisting authorization requests and one-use codes.
+// CreateAuthRequest implements op.AuthStorage for /authorize. ZITADEL has
+// validated the app request; this inserts its pending state before /login.
 func (s *Store) CreateAuthRequest(ctx context.Context, incoming *oidc.AuthRequest, userID string) (op.AuthRequest, error) {
 	a := &authRequest{
 		ID: uuid.NewString(), ClientID: incoming.ClientID, RedirectURI: incoming.RedirectURI,
@@ -28,12 +28,16 @@ func (s *Store) CreateAuthRequest(ctx context.Context, incoming *oidc.AuthReques
 	return a, nil
 }
 
+// AuthRequestByID loads a pending or completed request while it is still fresh.
+// Our /login handler and ZITADEL's /authorize/callback both call it.
 func (s *Store) AuthRequestByID(ctx context.Context, id string) (op.AuthRequest, error) {
 	var a authRequest
 	err := s.db.WithContext(ctx).First(&a, "id = ? AND created_at > ?", id, time.Now().UTC().Add(-AuthRequestLifetime)).Error
 	return &a, err
 }
 
+// AuthRequestByCode implements the /oauth/token code lookup. It atomically marks
+// a valid, unexpired code as used before ZITADEL performs the remaining checks.
 func (s *Store) AuthRequestByCode(ctx context.Context, code string) (op.AuthRequest, error) {
 	// Consuming on lookup makes concurrent exchanges unable to redeem the same code.
 	var a authRequest
@@ -55,6 +59,8 @@ func (s *Store) AuthRequestByCode(ctx context.Context, code string) (op.AuthRequ
 	return &a, err
 }
 
+// SaveAuthCode is called by ZITADEL at /authorize/callback after login. It
+// stores the one-use code's hash and expiry on the completed request row.
 func (s *Store) SaveAuthCode(ctx context.Context, id, code string) error {
 	expires := time.Now().UTC().Add(codeLifetime)
 	result := s.db.WithContext(ctx).Model(&authRequest{}).
@@ -69,12 +75,14 @@ func (s *Store) SaveAuthCode(ctx context.Context, id, code string) error {
 	return nil
 }
 
+// DeleteAuthRequest removes the row after ZITADEL successfully creates tokens
+// from the app's authorization code.
 func (s *Store) DeleteAuthRequest(ctx context.Context, id string) error {
 	return s.db.WithContext(ctx).Delete(&authRequest{}, "id = ?", id).Error
 }
 
-// The methods through EndSession support our Google callback and identity browser
-// session. They are called by our handlers, not by the op.Storage interface.
+// BeginGoogle is our /login step when there is no identity session. It saves
+// a state hash on the pending request and returns the value for the browser.
 func (s *Store) BeginGoogle(ctx context.Context, requestID string) (string, error) {
 	state, err := randomString()
 	if err != nil {
@@ -93,6 +101,8 @@ func (s *Store) BeginGoogle(ctx context.Context, requestID string) (string, erro
 	return state, nil
 }
 
+// CompleteGoogle finishes /auth/callback by consuming the Google state and
+// attaching the verified user and authentication time to the pending request.
 func (s *Store) CompleteGoogle(ctx context.Context, state, userID string) (string, time.Time, error) {
 	var requestID string
 	var authTime time.Time
@@ -117,12 +127,16 @@ func (s *Store) CompleteGoogle(ctx context.Context, state, userID string) (strin
 	return requestID, authTime, err
 }
 
+// RequestIDForGoogleState checks that Google's returned state still belongs to
+// an unfinished request before /auth/callback exchanges Google's code.
 func (s *Store) RequestIDForGoogleState(ctx context.Context, state string) (string, error) {
 	var a authRequest
 	err := s.db.WithContext(ctx).First(&a, "google_state_hash = ? AND created_at > ? AND done = false", hash(state), time.Now().UTC().Add(-AuthRequestLifetime)).Error
 	return a.ID, err
 }
 
+// CompleteSessionLogin finishes /login without Google when the browser already
+// has an identity session, preserving its original authentication time.
 func (s *Store) CompleteSessionLogin(ctx context.Context, requestID, userID string, authTime time.Time) error {
 	now := time.Now().UTC()
 	result := s.db.WithContext(ctx).Model(&authRequest{}).
@@ -137,6 +151,8 @@ func (s *Store) CompleteSessionLogin(ctx context.Context, requestID, userID stri
 	return nil
 }
 
+// CreateSession gives /auth/callback a random identity cookie value and stores
+// only its hash, user, authentication time, and expiry in Postgres.
 func (s *Store) CreateSession(ctx context.Context, userID string, authTime time.Time) (string, error) {
 	value, err := randomString()
 	if err != nil {
@@ -146,6 +162,8 @@ func (s *Store) CreateSession(ctx context.Context, userID string, authTime time.
 	return value, err
 }
 
+// SessionUser resolves an unexpired identity cookie during /login, allowing
+// the browser to skip Google while retaining the original authentication time.
 func (s *Store) SessionUser(ctx context.Context, value string) (string, time.Time, error) {
 	if value == "" {
 		return "", time.Time{}, gorm.ErrRecordNotFound
@@ -155,6 +173,7 @@ func (s *Store) SessionUser(ctx context.Context, value string) (string, time.Tim
 	return row.UserID, row.AuthTime, err
 }
 
+// EndSession removes the browser's identity session by cookie hash at /end_session.
 func (s *Store) EndSession(ctx context.Context, value string) error {
 	if value == "" {
 		return nil
@@ -162,7 +181,8 @@ func (s *Store) EndSession(ctx context.Context, value string) error {
 	return s.db.WithContext(ctx).Delete(&session{}, "id_hash = ?", hash(value)).Error
 }
 
-// TerminateSession implements op.AuthStorage for the library's logout flow.
+// TerminateSession implements op.AuthStorage for ZITADEL's logout flow. With a
+// known user it removes their identity sessions and this app's refresh tokens.
 func (s *Store) TerminateSession(ctx context.Context, userID, clientID string) error {
 	// Logout without an ID token hint has no subject. The HTTP handler still
 	// removes the current browser session using its cookie.

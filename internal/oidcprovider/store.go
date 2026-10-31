@@ -60,7 +60,8 @@ type Store struct {
 	key     signingKey
 }
 
-// NewStore is our constructor, not a method required by op.Storage.
+// NewStore builds our op.Storage implementation from Postgres, registered app
+// clients, and a signing key. It also returns the library's encryption key.
 func NewStore(db *gorm.DB, cfg *config.Config) (*Store, [32]byte, error) {
 	var cryptoKey [32]byte
 	decoded, err := base64.StdEncoding.DecodeString(cfg.CryptoKeyBase64)
@@ -120,8 +121,8 @@ func hash(value string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// The following exported methods through Health implement op.Storage's client,
-// signing-key, and health requirements.
+// GetClientByClientID lets ZITADEL load the app named in /authorize or
+// /oauth/token, including its allowed redirects and OIDC capabilities.
 func (s *Store) GetClientByClientID(_ context.Context, id string) (op.Client, error) {
 	c, ok := s.clients[id]
 	if !ok {
@@ -130,6 +131,7 @@ func (s *Store) GetClientByClientID(_ context.Context, id string) (op.Client, er
 	return c, nil
 }
 
+// AuthorizeClientIDSecret checks the app's secret during token exchange.
 func (s *Store) AuthorizeClientIDSecret(_ context.Context, id, secret string) error {
 	c, ok := s.clients[id]
 	if !ok || subtle.ConstantTimeCompare([]byte(c.Secret), []byte(secret)) != 1 {
@@ -138,10 +140,13 @@ func (s *Store) AuthorizeClientIDSecret(_ context.Context, id, secret string) er
 	return nil
 }
 
+// SigningKey gives ZITADEL the private key used to sign identity's JWTs.
 func (s *Store) SigningKey(context.Context) (op.SigningKey, error) { return s.key, nil }
 func (s *Store) SignatureAlgorithms(context.Context) ([]jose.SignatureAlgorithm, error) {
 	return []jose.SignatureAlgorithm{jose.RS256}, nil
 }
+
+// KeySet supplies only the public key advertised at /keys for app verification.
 func (s *Store) KeySet(context.Context) ([]op.Key, error) { return []op.Key{publicKey{s.key}}, nil }
 func (s *Store) GetKeyByIDAndClientID(context.Context, string, string) (*jose.JSONWebKey, error) {
 	return nil, errors.New("JWT client authentication is disabled")
@@ -149,6 +154,8 @@ func (s *Store) GetKeyByIDAndClientID(context.Context, string, string) (*jose.JS
 func (s *Store) ValidateJWTProfileScopes(context.Context, string, []string) ([]string, error) {
 	return nil, errors.New("JWT profile grant is disabled")
 }
+
+// Health lets the provider check that Postgres is reachable.
 func (s *Store) Health(ctx context.Context) error {
 	sqlDB, err := s.db.DB()
 	if err != nil {
@@ -157,7 +164,8 @@ func (s *Store) Health(ctx context.Context) error {
 	return sqlDB.PingContext(ctx)
 }
 
-// userInfo is our helper shared by the op.Storage claim and userinfo methods below.
+// userInfo reads KTHAIS identity and roles for the userinfo and token-claim
+// hooks below. Google does not supply KTHAIS roles.
 func (s *Store) userInfo(ctx context.Context, info *oidc.UserInfo, userID string) error {
 	var u user
 	if err := s.db.WithContext(ctx).First(&u, "id = ?", userID).Error; err != nil {
@@ -178,13 +186,17 @@ func (s *Store) userInfo(ctx context.Context, info *oidc.UserInfo, userID string
 	return nil
 }
 
-// These methods implement op.Storage's userinfo, introspection, and claim hooks.
+// SetUserinfoFromScopes supplies identity claims when ZITADEL creates an ID token.
 func (s *Store) SetUserinfoFromScopes(ctx context.Context, info *oidc.UserInfo, userID, _ string, _ []string) error {
 	return s.userInfo(ctx, info, userID)
 }
+
+// SetUserinfoFromToken supplies the claims returned by /userinfo.
 func (s *Store) SetUserinfoFromToken(ctx context.Context, info *oidc.UserInfo, _, subject, _ string) error {
 	return s.userInfo(ctx, info, subject)
 }
+
+// SetIntrospectionFromToken supplies claims for /oauth/introspect.
 func (s *Store) SetIntrospectionFromToken(ctx context.Context, result *oidc.IntrospectionResponse, _, subject, _ string) error {
 	info := new(oidc.UserInfo)
 	if err := s.userInfo(ctx, info, subject); err != nil {
@@ -193,6 +205,9 @@ func (s *Store) SetIntrospectionFromToken(ctx context.Context, result *oidc.Intr
 	result.SetUserInfo(info)
 	return nil
 }
+
+// GetPrivateClaimsFromScopes puts the current email and roles into JWT claims
+// when ZITADEL issues an access token, including after a refresh.
 func (s *Store) GetPrivateClaimsFromScopes(ctx context.Context, userID, _ string, _ []string) (map[string]any, error) {
 	info := new(oidc.UserInfo)
 	if err := s.userInfo(ctx, info, userID); err != nil {
@@ -202,8 +217,9 @@ func (s *Store) GetPrivateClaimsFromScopes(ctx context.Context, userID, _ string
 }
 
 // FindOrCreateGoogleUser is called by our Google callback, not by op.Storage.
-// It uses Google's stable subject. It never links an imported
-// email-only account automatically: that needs a separate, reviewed migration policy.
+// It finds a user by Google's stable subject, updates a changed verified email,
+// or creates a user with the default user role. An email match without a
+// matching subject requires explicit linking instead of silently joining accounts.
 func (s *Store) FindOrCreateGoogleUser(ctx context.Context, subject, email string) (string, error) {
 	if subject == "" || email == "" {
 		return "", errors.New("missing verified Google identity")

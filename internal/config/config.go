@@ -47,6 +47,9 @@ type Config struct {
 	Clients             []Client
 }
 
+// Load reads the process environment at startup; main first tries to load a
+// local .env without replacing existing variables. Defaults apply only when
+// a variable is absent, so local ports can override the image's 8000/8001.
 func Load() *Config {
 	return &Config{
 		Host:                getEnv("HOST", ""),
