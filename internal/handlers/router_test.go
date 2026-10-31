@@ -1,15 +1,28 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/kthaisociety/identity-service/internal/safelog"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+func captureSafeLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	previous := slog.Default()
+	output := new(bytes.Buffer)
+	slog.SetDefault(safelog.New(output))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	return output
+}
 
 func healthyDB(context.Context) error { return nil }
 
@@ -56,4 +69,37 @@ func TestServiceSecret(t *testing.T) {
 
 	// An empty configured secret rejects everything.
 	assert.Equal(t, http.StatusUnauthorized, get(newRouter(""), "/v1/ping", "anything").Code)
+}
+
+func TestRecoveredPanicLogsOnlyItsCategory(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	logs := captureSafeLogs(t)
+	r := NewInternalRouter(Deps{PingDB: func(context.Context) error { panic("panic-secret-sentinel") }})
+
+	w := get(r, "/health?code=code-secret-sentinel&email=person@example.com", "")
+	require.Equal(t, http.StatusInternalServerError, w.Code)
+	require.Equal(t, 1, bytes.Count(logs.Bytes(), []byte("category=panic_recovered")))
+	require.Contains(t, logs.String(), "listener=internal")
+	for _, secret := range []string{"panic-secret-sentinel", "code-secret-sentinel", "person@example.com"} {
+		require.NotContains(t, logs.String(), secret)
+	}
+	t.Logf("safe log output:\n%s", logs.String())
+}
+
+func TestOIDCErrorRedirectLogsWithoutItsURL(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	logs := captureSafeLogs(t)
+	r := gin.New()
+	r.Use(failureLogging("public"), safeRecovery())
+	r.GET("/authorize", func(c *gin.Context) {
+		c.Redirect(http.StatusFound, "https://app.example/callback?error=access_denied&state=state-secret-sentinel")
+	})
+
+	w := get(r, "/authorize?code=code-secret-sentinel", "")
+	require.Equal(t, http.StatusFound, w.Code)
+	require.Equal(t, 1, bytes.Count(logs.Bytes(), []byte("category=authorization_failed")))
+	for _, secret := range []string{"state-secret-sentinel", "code-secret-sentinel", "app.example", "access_denied"} {
+		require.NotContains(t, logs.String(), secret)
+	}
+	t.Logf("safe log output:\n%s", logs.String())
 }
