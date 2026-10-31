@@ -12,6 +12,8 @@ import (
 	"gorm.io/gorm"
 )
 
+// These methods through DeleteAuthRequest implement op.AuthStorage, the library's
+// contract for persisting authorization requests and one-use codes.
 func (s *Store) CreateAuthRequest(ctx context.Context, incoming *oidc.AuthRequest, userID string) (op.AuthRequest, error) {
 	a := &authRequest{
 		ID: uuid.NewString(), ClientID: incoming.ClientID, RedirectURI: incoming.RedirectURI,
@@ -71,6 +73,8 @@ func (s *Store) DeleteAuthRequest(ctx context.Context, id string) error {
 	return s.db.WithContext(ctx).Delete(&authRequest{}, "id = ?", id).Error
 }
 
+// The methods through EndSession support our Google callback and identity browser
+// session. They are called by our handlers, not by the op.Storage interface.
 func (s *Store) BeginGoogle(ctx context.Context, requestID string) (string, error) {
 	state, err := randomString()
 	if err != nil {
@@ -158,6 +162,7 @@ func (s *Store) EndSession(ctx context.Context, value string) error {
 	return s.db.WithContext(ctx).Delete(&session{}, "id_hash = ?", hash(value)).Error
 }
 
+// TerminateSession implements op.AuthStorage for the library's logout flow.
 func (s *Store) TerminateSession(ctx context.Context, userID, clientID string) error {
 	// Logout without an ID token hint has no subject. The HTTP handler still
 	// removes the current browser session using its cookie.

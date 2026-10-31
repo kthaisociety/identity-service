@@ -35,6 +35,7 @@ const (
 	SessionLifetime      = 12 * time.Hour
 )
 
+// signingKey implements op.SigningKey; publicKey implements op.Key.
 type signingKey struct {
 	id      string
 	private *rsa.PrivateKey
@@ -50,13 +51,16 @@ type publicKey struct{ signingKey }
 
 func (k publicKey) Key() any { return &k.private.PublicKey }
 
-// Store uses one Postgres database for all OIDC state, so restarts do not sign users out.
+// Store implements ZITADEL's op.Storage contract across this file, authorization.go,
+// and tokens.go. Its other methods support our Google sign-in and browser sessions.
+// One Postgres database keeps OIDC state across restarts.
 type Store struct {
 	db      *gorm.DB
 	clients map[string]client
 	key     signingKey
 }
 
+// NewStore is our constructor, not a method required by op.Storage.
 func NewStore(db *gorm.DB, cfg *config.Config) (*Store, [32]byte, error) {
 	var cryptoKey [32]byte
 	decoded, err := base64.StdEncoding.DecodeString(cfg.CryptoKeyBase64)
@@ -75,6 +79,7 @@ func NewStore(db *gorm.DB, cfg *config.Config) (*Store, [32]byte, error) {
 	return &Store{db: db, clients: clients, key: key}, cryptoKey, nil
 }
 
+// parseSigningKey is our configuration helper; the library receives the parsed key.
 func parseSigningKey(encoded string) (signingKey, error) {
 	data, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
@@ -101,6 +106,7 @@ func parseSigningKey(encoded string) (signingKey, error) {
 	return signingKey{id: hex.EncodeToString(thumbprint[:8]), private: key}, nil
 }
 
+// randomString and hash are local helpers for opaque values stored by their hashes.
 func randomString() (string, error) {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
@@ -114,6 +120,8 @@ func hash(value string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// The following exported methods through Health implement op.Storage's client,
+// signing-key, and health requirements.
 func (s *Store) GetClientByClientID(_ context.Context, id string) (op.Client, error) {
 	c, ok := s.clients[id]
 	if !ok {
@@ -149,6 +157,7 @@ func (s *Store) Health(ctx context.Context) error {
 	return sqlDB.PingContext(ctx)
 }
 
+// userInfo is our helper shared by the op.Storage claim and userinfo methods below.
 func (s *Store) userInfo(ctx context.Context, info *oidc.UserInfo, userID string) error {
 	var u user
 	if err := s.db.WithContext(ctx).First(&u, "id = ?", userID).Error; err != nil {
@@ -169,6 +178,7 @@ func (s *Store) userInfo(ctx context.Context, info *oidc.UserInfo, userID string
 	return nil
 }
 
+// These methods implement op.Storage's userinfo, introspection, and claim hooks.
 func (s *Store) SetUserinfoFromScopes(ctx context.Context, info *oidc.UserInfo, userID, _ string, _ []string) error {
 	return s.userInfo(ctx, info, userID)
 }
@@ -191,7 +201,8 @@ func (s *Store) GetPrivateClaimsFromScopes(ctx context.Context, userID, _ string
 	return map[string]any{"email": info.Email, "roles": info.Claims["roles"]}, nil
 }
 
-// FindOrCreateGoogleUser uses Google's stable subject. It never links an imported
+// FindOrCreateGoogleUser is called by our Google callback, not by op.Storage.
+// It uses Google's stable subject. It never links an imported
 // email-only account automatically: that needs a separate, reviewed migration policy.
 func (s *Store) FindOrCreateGoogleUser(ctx context.Context, subject, email string) (string, error) {
 	if subject == "" || email == "" {

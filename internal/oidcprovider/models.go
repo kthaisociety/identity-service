@@ -8,6 +8,7 @@ import (
 	"github.com/zitadel/oidc/v3/pkg/op"
 )
 
+// user and userRole are our KTHAIS database models, not library interfaces.
 type user struct {
 	ID        string `gorm:"primaryKey;type:uuid"`
 	Email     string
@@ -24,6 +25,7 @@ type userRole struct {
 func (userRole) TableName() string { return "user_roles" }
 
 // authRequest is the durable state behind the library's authorization flow.
+// Its getters and Done method implement op.AuthRequest; TableName is for GORM.
 type authRequest struct {
 	ID                  string `gorm:"primaryKey"`
 	ClientID            string
@@ -74,6 +76,7 @@ func (a *authRequest) Done() bool                         { return a.IsDone }
 
 var _ op.AuthRequest = (*authRequest)(nil)
 
+// refreshToken is a database row whose methods implement op.RefreshTokenRequest.
 type refreshToken struct {
 	TokenHash string `gorm:"primaryKey"`
 	UserID    string `gorm:"type:uuid"`
@@ -94,6 +97,7 @@ func (r *refreshToken) SetCurrentScopes(scopes []string) { r.Scopes = strings.Jo
 
 var _ op.RefreshTokenRequest = (*refreshToken)(nil)
 
+// session is our identity browser session, not a library interface type.
 type session struct {
 	IDHash    string `gorm:"primaryKey"`
 	UserID    string `gorm:"type:uuid"`

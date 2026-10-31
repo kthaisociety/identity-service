@@ -9,6 +9,7 @@ import (
 	"github.com/zitadel/oidc/v3/pkg/op"
 )
 
+// client implements the library's op.Client contract for each configured app.
 type client struct {
 	config.Client
 	dev bool
@@ -37,6 +38,7 @@ func (c client) IsScopeAllowed(scope string) bool     { return false }
 func (c client) IDTokenUserinfoClaimsAssertion() bool { return false }
 func (c client) ClockSkew() time.Duration             { return 0 }
 
+// passthroughScopes is our helper used by two op.Client methods above.
 func passthroughScopes(scopes []string) []string { return scopes }
 
 var _ op.Client = client{}

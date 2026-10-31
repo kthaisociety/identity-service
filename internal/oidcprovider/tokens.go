@@ -12,6 +12,7 @@ import (
 	"gorm.io/gorm"
 )
 
+// These methods implement op.AuthStorage's token persistence and revocation contract.
 func (s *Store) CreateAccessToken(context.Context, op.TokenRequest) (string, time.Time, error) {
 	return uuid.NewString(), time.Now().UTC().Add(accessTokenLifetime), nil
 }
