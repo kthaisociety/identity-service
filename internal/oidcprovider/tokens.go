@@ -20,7 +20,8 @@ func (s *Store) CreateAccessToken(context.Context, op.TokenRequest) (string, tim
 
 // CreateAccessAndRefreshTokens issues a new opaque refresh token for
 // /oauth/token. On refresh it removes the current token and stores the new
-// token's hash in one transaction; ZITADEL signs the access JWT separately.
+// token's hash in one transaction. No replacement can outlive 90 days from
+// the original sign-in; ZITADEL signs the access JWT separately.
 func (s *Store) CreateAccessAndRefreshTokens(ctx context.Context, request op.TokenRequest, current string) (string, string, time.Time, error) {
 	clientRequest, ok := request.(interface {
 		GetClientID() string
@@ -29,18 +30,28 @@ func (s *Store) CreateAccessAndRefreshTokens(ctx context.Context, request op.Tok
 	if !ok {
 		return "", "", time.Time{}, errors.New("unsupported token request")
 	}
+	now := time.Now().UTC()
+	authTime := clientRequest.GetAuthTime()
+	absoluteExpiry := authTime.Add(refreshAbsoluteLifetime)
+	if !now.Before(absoluteExpiry) {
+		return "", "", time.Time{}, op.ErrInvalidRefreshToken
+	}
+	expiresAt := now.Add(refreshTokenLifetime)
+	if expiresAt.After(absoluteExpiry) {
+		expiresAt = absoluteExpiry
+	}
 	value, err := randomString()
 	if err != nil {
 		return "", "", time.Time{}, err
 	}
 	row := refreshToken{
 		TokenHash: hash(value), UserID: request.GetSubject(), ClientID: clientRequest.GetClientID(),
-		Scopes: strings.Join(request.GetScopes(), " "), AuthTime: clientRequest.GetAuthTime(),
-		ExpiresAt: time.Now().UTC().Add(refreshTokenLifetime),
+		Scopes: strings.Join(request.GetScopes(), " "), AuthTime: authTime,
+		ExpiresAt: expiresAt,
 	}
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if current != "" {
-			result := tx.Delete(&refreshToken{}, "token_hash = ? AND user_id = ? AND client_id = ? AND expires_at > ?", hash(current), row.UserID, row.ClientID, time.Now().UTC())
+			result := tx.Delete(&refreshToken{}, "token_hash = ? AND user_id = ? AND client_id = ? AND expires_at > ? AND auth_time > ?", hash(current), row.UserID, row.ClientID, now, now.Add(-refreshAbsoluteLifetime))
 			if result.Error != nil {
 				return result.Error
 			}
@@ -53,14 +64,15 @@ func (s *Store) CreateAccessAndRefreshTokens(ctx context.Context, request op.Tok
 	if err != nil {
 		return "", "", time.Time{}, err
 	}
-	return uuid.NewString(), value, time.Now().UTC().Add(accessTokenLifetime), nil
+	return uuid.NewString(), value, now.Add(accessTokenLifetime), nil
 }
 
-// TokenRequestByRefreshToken loads an unexpired token's user, app, and scopes
-// by hash for ZITADEL's /oauth/token refresh flow.
+// TokenRequestByRefreshToken loads a token only while both its own expiry and
+// the original sign-in's 90-day limit remain valid.
 func (s *Store) TokenRequestByRefreshToken(ctx context.Context, value string) (op.RefreshTokenRequest, error) {
 	var row refreshToken
-	err := s.db.WithContext(ctx).First(&row, "token_hash = ? AND expires_at > ?", hash(value), time.Now().UTC()).Error
+	now := time.Now().UTC()
+	err := s.db.WithContext(ctx).First(&row, "token_hash = ? AND expires_at > ? AND auth_time > ?", hash(value), now, now.Add(-refreshAbsoluteLifetime)).Error
 	if err != nil {
 		return nil, op.ErrInvalidRefreshToken
 	}

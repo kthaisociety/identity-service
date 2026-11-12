@@ -342,6 +342,26 @@ func TestOIDCFlowAndRefresh(t *testing.T) {
 	require.Contains(t, login.Header().Get("Location"), "google.example/authorize")
 }
 
+func TestRefreshRejectsOldOriginalSignIn(t *testing.T) {
+	p := newPrototype(t)
+	code, _, verifier := p.signIn(t)
+	issued := p.exchange(code, verifier, "app", "secret", "http://127.0.0.1:8012/callback")
+	require.Equal(t, http.StatusOK, issued.Code)
+	var tokens struct {
+		RefreshToken string `json:"refresh_token"`
+	}
+	require.NoError(t, json.Unmarshal(issued.Body.Bytes(), &tokens))
+	require.NoError(t, p.db.Exec("UPDATE oidc_refresh_tokens SET auth_time = now() - interval '91 days', expires_at = now() + interval '1 day'").Error)
+	renewed := p.request(http.MethodPost, "/oauth/token", url.Values{
+		"grant_type": {"refresh_token"}, "refresh_token": {tokens.RefreshToken},
+	}, nil, "app", "secret")
+	require.Equal(t, http.StatusBadRequest, renewed.Code, renewed.Body.String())
+	require.Contains(t, renewed.Body.String(), "invalid_grant")
+	var count int64
+	require.NoError(t, p.db.Raw("SELECT count(*) FROM oidc_refresh_tokens").Scan(&count).Error)
+	require.EqualValues(t, 1, count, "a rejected refresh must not issue another token")
+}
+
 func TestAuthorizeRejectsUnsupportedParsedOptions(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
