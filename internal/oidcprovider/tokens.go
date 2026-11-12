@@ -10,6 +10,7 @@ import (
 	"github.com/zitadel/oidc/v3/pkg/oidc"
 	"github.com/zitadel/oidc/v3/pkg/op"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // CreateAccessToken gives ZITADEL an ID and one-hour expiry for a signed access
@@ -18,10 +19,23 @@ func (s *Store) CreateAccessToken(context.Context, op.TokenRequest) (string, tim
 	return uuid.NewString(), time.Now().UTC().Add(accessTokenLifetime), nil
 }
 
+// ZITADEL forwards errors from token creation directly to the HTTP response.
+// Mark an invalid refresh as an OAuth grant error rather than a server error.
+func invalidRefreshGrant() error {
+	return oidc.ErrInvalidGrant().WithParent(op.ErrInvalidRefreshToken)
+}
+
+func refreshLookupError(err error) error {
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return invalidRefreshGrant()
+	}
+	return err
+}
+
 // CreateAccessAndRefreshTokens issues a new opaque refresh token for
-// /oauth/token. On refresh it removes the current token and stores the new
-// token's hash in one transaction. No replacement can outlive 90 days from
-// the original sign-in; ZITADEL signs the access JWT separately.
+// /oauth/token. A refresh marks the old token used and stores the replacement
+// in one transaction. Reusing a token revokes its entire family. ZITADEL signs
+// the access JWT separately.
 func (s *Store) CreateAccessAndRefreshTokens(ctx context.Context, request op.TokenRequest, current string) (string, string, time.Time, error) {
 	clientRequest, ok := request.(interface {
 		GetClientID() string
@@ -30,15 +44,11 @@ func (s *Store) CreateAccessAndRefreshTokens(ctx context.Context, request op.Tok
 	if !ok {
 		return "", "", time.Time{}, errors.New("unsupported token request")
 	}
-	now := time.Now().UTC()
 	authTime := clientRequest.GetAuthTime()
 	absoluteExpiry := authTime.Add(refreshAbsoluteLifetime)
+	now := time.Now().UTC()
 	if !now.Before(absoluteExpiry) {
-		return "", "", time.Time{}, op.ErrInvalidRefreshToken
-	}
-	expiresAt := now.Add(refreshTokenLifetime)
-	if expiresAt.After(absoluteExpiry) {
-		expiresAt = absoluteExpiry
+		return "", "", time.Time{}, invalidRefreshGrant()
 	}
 	value, err := randomString()
 	if err != nil {
@@ -47,33 +57,84 @@ func (s *Store) CreateAccessAndRefreshTokens(ctx context.Context, request op.Tok
 	row := refreshToken{
 		TokenHash: hash(value), UserID: request.GetSubject(), ClientID: clientRequest.GetClientID(),
 		Scopes: strings.Join(request.GetScopes(), " "), AuthTime: authTime,
-		ExpiresAt: expiresAt,
 	}
+	replayed := false
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if current != "" {
-			result := tx.Delete(&refreshToken{}, "token_hash = ? AND user_id = ? AND client_id = ? AND expires_at > ? AND auth_time > ?", hash(current), row.UserID, row.ClientID, now, now.Add(-refreshAbsoluteLifetime))
-			if result.Error != nil {
-				return result.Error
+		if current == "" {
+			family := refreshFamily{
+				ID: uuid.NewString(), UserID: row.UserID, ClientID: row.ClientID, ExpiresAt: absoluteExpiry,
 			}
-			if result.RowsAffected != 1 {
-				return op.ErrInvalidRefreshToken
+			if err := tx.Create(&family).Error; err != nil {
+				return err
 			}
+			row.FamilyID = family.ID
+		} else {
+			// Read the family ID, then lock its row. Every operation that changes
+			// a chain locks this row before checking the token again.
+			var previous refreshToken
+			if err := tx.Select("family_id").First(&previous, "token_hash = ?", hash(current)).Error; err != nil {
+				return refreshLookupError(err)
+			}
+			var family refreshFamily
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&family, "id = ?", previous.FamilyID).Error; err != nil {
+				return refreshLookupError(err)
+			}
+			now = time.Now().UTC()
+			if family.RevokedAt != nil || !now.Before(family.ExpiresAt) || !now.Before(absoluteExpiry) {
+				return invalidRefreshGrant()
+			}
+			if err := tx.First(&previous, "token_hash = ?", hash(current)).Error; err != nil {
+				return refreshLookupError(err)
+			}
+			if previous.FamilyID != family.ID || previous.UserID != row.UserID || previous.ClientID != row.ClientID ||
+				family.UserID != row.UserID || family.ClientID != row.ClientID || !previous.AuthTime.Equal(authTime) {
+				return invalidRefreshGrant()
+			}
+			if previous.UsedAt != nil {
+				// Commit the revocation before returning invalid_grant. Returning
+				// an error here would roll back the transaction.
+				replayed = true
+				return tx.Model(&family).Update("revoked_at", now).Error
+			}
+			if !now.Before(previous.ExpiresAt) {
+				return invalidRefreshGrant()
+			}
+			if err := tx.Model(&previous).Update("used_at", now).Error; err != nil {
+				return err
+			}
+			row.FamilyID = family.ID
+			absoluteExpiry = family.ExpiresAt
+		}
+		row.ExpiresAt = now.Add(refreshTokenLifetime)
+		if row.ExpiresAt.After(absoluteExpiry) {
+			row.ExpiresAt = absoluteExpiry
 		}
 		return tx.Create(&row).Error
 	})
 	if err != nil {
 		return "", "", time.Time{}, err
 	}
+	if replayed {
+		return "", "", time.Time{}, invalidRefreshGrant()
+	}
 	return uuid.NewString(), value, now.Add(accessTokenLifetime), nil
 }
 
-// TokenRequestByRefreshToken loads a token only while both its own expiry and
-// the original sign-in's 90-day limit remain valid.
+// TokenRequestByRefreshToken loads an active token or a used-token tombstone.
+// The latter must reach CreateAccessAndRefreshTokens so replay revocation occurs
+// only after ZITADEL checks the authenticated client's ID against the token.
 func (s *Store) TokenRequestByRefreshToken(ctx context.Context, value string) (op.RefreshTokenRequest, error) {
 	var row refreshToken
 	now := time.Now().UTC()
-	err := s.db.WithContext(ctx).First(&row, "token_hash = ? AND expires_at > ? AND auth_time > ?", hash(value), now, now.Add(-refreshAbsoluteLifetime)).Error
-	if err != nil {
+	if err := s.db.WithContext(ctx).First(&row, "token_hash = ?", hash(value)).Error; err != nil {
+		return nil, op.ErrInvalidRefreshToken
+	}
+	var family refreshFamily
+	if err := s.db.WithContext(ctx).First(&family, "id = ?", row.FamilyID).Error; err != nil {
+		return nil, op.ErrInvalidRefreshToken
+	}
+	if family.RevokedAt != nil || !now.Before(family.ExpiresAt) || !now.Before(row.AuthTime.Add(refreshAbsoluteLifetime)) ||
+		(row.UsedAt == nil && !now.Before(row.ExpiresAt)) {
 		return nil, op.ErrInvalidRefreshToken
 	}
 	return &row, nil
@@ -90,8 +151,9 @@ func (s *Store) GetRefreshTokenInfo(ctx context.Context, clientID, value string)
 	return row.UserID, row.TokenHash, nil
 }
 
-// RevokeToken deletes an app's refresh-token row for /revoke. Issued access
-// JWTs have no row to delete and remain valid until they expire.
+// RevokeToken ends the refresh family for /revoke, retaining used hashes so
+// revocation cannot erase replay evidence. Issued access JWTs stay valid until
+// they expire.
 func (s *Store) RevokeToken(ctx context.Context, tokenIDOrValue, userID, clientID string) *oidc.Error {
 	// The library passes the stored token ID after a successful refresh-token
 	// lookup, and the raw value if no lookup succeeded. Access-token IDs have no
@@ -100,7 +162,25 @@ func (s *Store) RevokeToken(ctx context.Context, tokenIDOrValue, userID, clientI
 	if userID == "" {
 		tokenHash = hash(tokenIDOrValue)
 	}
-	if err := s.db.WithContext(ctx).Delete(&refreshToken{}, "token_hash = ? AND client_id = ?", tokenHash, clientID).Error; err != nil {
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var token refreshToken
+		err := tx.First(&token, "token_hash = ? AND client_id = ?", tokenHash, clientID).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil // RFC 7009 also succeeds for unknown tokens.
+		}
+		if err != nil {
+			return err
+		}
+		var family refreshFamily
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&family, "id = ?", token.FamilyID).Error; err != nil {
+			return err
+		}
+		if family.ClientID != clientID || family.RevokedAt != nil {
+			return nil
+		}
+		return tx.Model(&family).Update("revoked_at", time.Now().UTC()).Error
+	})
+	if err != nil {
 		return oidc.ErrServerError().WithParent(err)
 	}
 	return nil

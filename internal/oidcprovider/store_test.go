@@ -106,8 +106,6 @@ func TestRefreshTokenRotatesAndSessionEnds(t *testing.T) {
 	_, second, _, err := s.CreateAccessAndRefreshTokens(ctx, r, first)
 	require.NoError(t, err)
 	require.NotEqual(t, first, second)
-	_, err = s.TokenRequestByRefreshToken(ctx, first)
-	require.True(t, errors.Is(err, op.ErrInvalidRefreshToken))
 	_, err = s.TokenRequestByRefreshToken(ctx, second)
 	require.NoError(t, err)
 
@@ -126,6 +124,141 @@ func TestRefreshTokenRotatesAndSessionEnds(t *testing.T) {
 	require.Error(t, err)
 	_, err = s.TokenRequestByRefreshToken(ctx, second)
 	require.True(t, errors.Is(err, op.ErrInvalidRefreshToken))
+}
+
+func newRefreshChain(t *testing.T, s *Store, userID string) string {
+	t.Helper()
+	authTime := time.Now().UTC()
+	_, value, _, err := s.CreateAccessAndRefreshTokens(context.Background(),
+		&authRequest{ClientID: "app", UserID: userID, Scopes: "openid offline_access", AuthTime: &authTime}, "")
+	require.NoError(t, err)
+	return value
+}
+
+func rotateRefresh(t *testing.T, s *Store, value string) string {
+	t.Helper()
+	request, err := s.TokenRequestByRefreshToken(context.Background(), value)
+	require.NoError(t, err)
+	_, next, _, err := s.CreateAccessAndRefreshTokens(context.Background(), request, value)
+	require.NoError(t, err)
+	return next
+}
+
+type refreshResult struct {
+	value string
+	err   error
+}
+
+func TestRefreshReplayRevokesOnlyItsChain(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	userID, err := s.FindOrCreateGoogleUser(ctx, "google-1", "person@example.com")
+	require.NoError(t, err)
+	first := newRefreshChain(t, s, userID)
+	second := rotateRefresh(t, s, first)
+	third := rotateRefresh(t, s, second)
+	independent := newRefreshChain(t, s, userID)
+	// R1's own 30-day expiry can pass while R3 remains usable. Its used hash
+	// must still identify the chain until the original 90-day deadline.
+	require.NoError(t, s.db.Model(&refreshToken{}).Where("token_hash = ?", hash(first)).
+		Update("expires_at", time.Now().UTC().Add(-time.Hour)).Error)
+
+	used, err := s.TokenRequestByRefreshToken(ctx, first)
+	require.NoError(t, err, "used hashes must remain available for replay detection")
+	_, _, _, err = s.CreateAccessAndRefreshTokens(ctx, used, first)
+	require.ErrorIs(t, err, op.ErrInvalidRefreshToken)
+	_, err = s.TokenRequestByRefreshToken(ctx, third)
+	require.ErrorIs(t, err, op.ErrInvalidRefreshToken)
+	_, err = s.TokenRequestByRefreshToken(ctx, independent)
+	require.NoError(t, err, "a different sign-in must keep its refresh token")
+
+	var old refreshToken
+	require.NoError(t, s.db.First(&old, "token_hash = ?", hash(first)).Error)
+	require.NotNil(t, old.UsedAt)
+	var family refreshFamily
+	require.NoError(t, s.db.First(&family, "id = ?", old.FamilyID).Error)
+	require.NotNil(t, family.RevokedAt)
+}
+
+func TestConcurrentRefreshReplayRevokesReplacement(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	userID, err := s.FindOrCreateGoogleUser(ctx, "google-1", "person@example.com")
+	require.NoError(t, err)
+	first := newRefreshChain(t, s, userID)
+	request, err := s.TokenRequestByRefreshToken(ctx, first)
+	require.NoError(t, err)
+
+	results := make(chan refreshResult, 2)
+	for range 2 {
+		go func() {
+			_, value, _, err := s.CreateAccessAndRefreshTokens(ctx, request, first)
+			results <- refreshResult{value, err}
+		}()
+	}
+	one, two := <-results, <-results
+	success, replay := one, two
+	if success.err != nil {
+		success, replay = two, one
+	}
+	require.NoError(t, success.err)
+	require.NotEmpty(t, success.value)
+	require.ErrorIs(t, replay.err, op.ErrInvalidRefreshToken)
+	_, err = s.TokenRequestByRefreshToken(ctx, success.value)
+	require.ErrorIs(t, err, op.ErrInvalidRefreshToken)
+}
+
+func TestConcurrentLogoutAndRefreshLeavesNoLiveToken(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	userID, err := s.FindOrCreateGoogleUser(ctx, "google-1", "person@example.com")
+	require.NoError(t, err)
+	first := newRefreshChain(t, s, userID)
+	request, err := s.TokenRequestByRefreshToken(ctx, first)
+	require.NoError(t, err)
+	cookie, err := s.CreateSession(ctx, userID, time.Now().UTC())
+	require.NoError(t, err)
+
+	start := make(chan struct{})
+	refreshed := make(chan refreshResult, 1)
+	loggedOut := make(chan error, 1)
+	go func() {
+		<-start
+		_, value, _, err := s.CreateAccessAndRefreshTokens(ctx, request, first)
+		refreshed <- refreshResult{value, err}
+	}()
+	go func() {
+		<-start
+		loggedOut <- s.TerminateBrowserSession(ctx, cookie, userID, "app")
+	}()
+	close(start)
+	result := <-refreshed
+	require.NoError(t, <-loggedOut)
+	if result.err == nil {
+		_, err = s.TokenRequestByRefreshToken(ctx, result.value)
+		require.ErrorIs(t, err, op.ErrInvalidRefreshToken)
+	} else {
+		require.ErrorIs(t, result.err, op.ErrInvalidRefreshToken)
+	}
+}
+
+func TestRevokingUsedRefreshTokenEndsItsChain(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	userID, err := s.FindOrCreateGoogleUser(ctx, "google-1", "person@example.com")
+	require.NoError(t, err)
+	first := newRefreshChain(t, s, userID)
+	second := rotateRefresh(t, s, first)
+	independent := newRefreshChain(t, s, userID)
+
+	owner, tokenID, err := s.GetRefreshTokenInfo(ctx, "app", first)
+	require.NoError(t, err)
+	require.Equal(t, userID, owner)
+	require.Nil(t, s.RevokeToken(ctx, tokenID, owner, "app"))
+	_, err = s.TokenRequestByRefreshToken(ctx, second)
+	require.ErrorIs(t, err, op.ErrInvalidRefreshToken)
+	_, err = s.TokenRequestByRefreshToken(ctx, independent)
+	require.NoError(t, err)
 }
 
 func TestRefreshTokenCannotOutliveOriginalSignIn(t *testing.T) {

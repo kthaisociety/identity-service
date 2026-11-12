@@ -208,6 +208,12 @@ func (p *prototype) exchange(code, verifier, clientID, clientSecret, redirect st
 	}, nil, clientID, clientSecret)
 }
 
+func (p *prototype) refresh(value, clientID, secret string) *httptest.ResponseRecorder {
+	return p.request(http.MethodPost, "/oauth/token", url.Values{
+		"grant_type": {"refresh_token"}, "refresh_token": {value},
+	}, nil, clientID, secret)
+}
+
 func TestOIDCFlowAndRefresh(t *testing.T) {
 	p := newPrototype(t)
 	discovery := p.request(http.MethodGet, "/.well-known/openid-configuration", nil, nil, "", "")
@@ -362,6 +368,50 @@ func TestRefreshRejectsOldOriginalSignIn(t *testing.T) {
 	require.EqualValues(t, 1, count, "a rejected refresh must not issue another token")
 }
 
+func TestRefreshReplayRevokesOnlyThePresentedChain(t *testing.T) {
+	p := newPrototype(t)
+	_, tokens := p.issueLogoutTokens(t)
+	decodeRefresh := func(response *httptest.ResponseRecorder) string {
+		t.Helper()
+		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		var body struct {
+			RefreshToken string `json:"refresh_token"`
+		}
+		require.NoError(t, json.Unmarshal(response.Body.Bytes(), &body))
+		require.NotEmpty(t, body.RefreshToken)
+		return body.RefreshToken
+	}
+	second := decodeRefresh(p.refresh(tokens.RefreshToken, "app", "secret"))
+	require.Equal(t, http.StatusBadRequest, p.refresh(tokens.RefreshToken, "other", "other-secret").Code)
+	third := decodeRefresh(p.refresh(second, "app", "secret"))
+
+	replayed := p.refresh(tokens.RefreshToken, "app", "secret")
+	require.Equal(t, http.StatusBadRequest, replayed.Code, replayed.Body.String())
+	require.Contains(t, replayed.Body.String(), "invalid_grant")
+	require.Equal(t, http.StatusBadRequest, p.refresh(third, "app", "secret").Code)
+}
+
+func TestRevokingUsedRefreshThroughEndpointEndsItsChain(t *testing.T) {
+	p := newPrototype(t)
+	_, tokens := p.issueLogoutTokens(t)
+	renewed := p.refresh(tokens.RefreshToken, "app", "secret")
+	require.Equal(t, http.StatusOK, renewed.Code, renewed.Body.String())
+	var body struct {
+		RefreshToken string `json:"refresh_token"`
+	}
+	require.NoError(t, json.Unmarshal(renewed.Body.Bytes(), &body))
+	require.NotEmpty(t, body.RefreshToken)
+	// ZITADEL's /revoke lookup ignores an individually expired token, then
+	// passes the raw value to RevokeToken. The used hash must still revoke R2.
+	require.NoError(t, p.db.Exec("UPDATE oidc_refresh_tokens SET expires_at = now() - interval '1 day' WHERE used_at IS NOT NULL").Error)
+
+	revoked := p.request(http.MethodPost, "/revoke", url.Values{
+		"token": {tokens.RefreshToken}, "token_type_hint": {"refresh_token"},
+	}, nil, "app", "secret")
+	require.Equal(t, http.StatusOK, revoked.Code, revoked.Body.String())
+	require.Equal(t, http.StatusBadRequest, p.refresh(body.RefreshToken, "app", "secret").Code)
+}
+
 func TestAuthorizeRejectsUnsupportedParsedOptions(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -514,10 +564,13 @@ func TestLogoutWithIDTokenHintEndsSessionAndRefresh(t *testing.T) {
 	secondCookie, secondTokens := p.issueLogoutTokens(t)
 	var userID string
 	require.NoError(t, p.db.Raw("SELECT id FROM users WHERE google_sub = ?", "google-sub").Scan(&userID).Error)
+	otherFamily := "00000000-0000-0000-0000-000000000042"
+	require.NoError(t, p.db.Exec(`INSERT INTO oidc_refresh_families (id, user_id, client_id, expires_at)
+		VALUES (?, ?, 'other', now() + interval '90 days')`, otherFamily, userID).Error)
 	require.NoError(t, p.db.Exec(`INSERT INTO oidc_refresh_tokens
-		(token_hash, user_id, client_id, scopes, auth_time, expires_at)
-		VALUES (?, ?, ?, ?, now(), now() + interval '1 day')`,
-		"another-app-token", userID, "other", "openid").Error)
+		(token_hash, family_id, user_id, client_id, scopes, auth_time, expires_at)
+		VALUES (?, ?, ?, ?, ?, now(), now() + interval '1 day')`,
+		"another-app-token", otherFamily, userID, "other", "openid").Error)
 	query := url.Values{"id_token_hint": {tokens.IDToken}, "post_logout_redirect_uri": {"http://127.0.0.1:8012/"}, "state": {"logout-state"}}
 	logout := p.request(http.MethodGet, "/end_session?"+query.Encode(), nil, cookie, "", "")
 	require.Equal(t, http.StatusFound, logout.Code, logout.Body.String())
@@ -527,8 +580,8 @@ func TestLogoutWithIDTokenHintEndsSessionAndRefresh(t *testing.T) {
 	require.Equal(t, "logout-state", redirect.Query().Get("state"))
 	var sessions, appRefreshes, otherRefreshes int64
 	require.NoError(t, p.db.Raw("SELECT count(*) FROM oidc_sessions WHERE user_id = ?", userID).Scan(&sessions).Error)
-	require.NoError(t, p.db.Raw("SELECT count(*) FROM oidc_refresh_tokens WHERE user_id = ? AND client_id = 'app'", userID).Scan(&appRefreshes).Error)
-	require.NoError(t, p.db.Raw("SELECT count(*) FROM oidc_refresh_tokens WHERE user_id = ? AND client_id = 'other'", userID).Scan(&otherRefreshes).Error)
+	require.NoError(t, p.db.Raw("SELECT count(*) FROM oidc_refresh_families WHERE user_id = ? AND client_id = 'app' AND revoked_at IS NULL", userID).Scan(&appRefreshes).Error)
+	require.NoError(t, p.db.Raw("SELECT count(*) FROM oidc_refresh_families WHERE user_id = ? AND client_id = 'other' AND revoked_at IS NULL", userID).Scan(&otherRefreshes).Error)
 	require.Zero(t, sessions)
 	require.Zero(t, appRefreshes)
 	require.EqualValues(t, 1, otherRefreshes)
@@ -649,10 +702,10 @@ func TestLogoutStoreFailureRollsBack(t *testing.T) {
 	logs := captureSafeLogs(t)
 	p := newPrototype(t)
 	cookie, tokens := p.issueLogoutTokens(t)
-	require.NoError(t, p.db.Exec(`CREATE FUNCTION reject_refresh_delete() RETURNS trigger
+	require.NoError(t, p.db.Exec(`CREATE FUNCTION reject_refresh_revoke() RETURNS trigger
 		LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'rollback-sentinel'; END; $$`).Error)
-	require.NoError(t, p.db.Exec(`CREATE TRIGGER reject_refresh_delete BEFORE DELETE ON oidc_refresh_tokens
-		FOR EACH ROW EXECUTE FUNCTION reject_refresh_delete()`).Error)
+	require.NoError(t, p.db.Exec(`CREATE TRIGGER reject_refresh_revoke BEFORE UPDATE OF revoked_at ON oidc_refresh_families
+		FOR EACH ROW EXECUTE FUNCTION reject_refresh_revoke()`).Error)
 	logs.Reset()
 	response := p.request(http.MethodGet, "/end_session?id_token_hint="+url.QueryEscape(tokens.IDToken), nil, cookie, "", "")
 	require.Equal(t, http.StatusInternalServerError, response.Code)
@@ -679,7 +732,7 @@ func TestParallelLogoutUsesSessionOnce(t *testing.T) {
 	require.Equal(t, []int{http.StatusFound, http.StatusBadRequest}, statuses)
 	var sessions, refreshes int64
 	require.NoError(t, p.db.Raw("SELECT count(*) FROM oidc_sessions").Scan(&sessions).Error)
-	require.NoError(t, p.db.Raw("SELECT count(*) FROM oidc_refresh_tokens").Scan(&refreshes).Error)
+	require.NoError(t, p.db.Raw("SELECT count(*) FROM oidc_refresh_families WHERE revoked_at IS NULL").Scan(&refreshes).Error)
 	require.Zero(t, sessions)
 	require.Zero(t, refreshes)
 }

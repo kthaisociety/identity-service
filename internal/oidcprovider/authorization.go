@@ -243,7 +243,10 @@ func (s *Store) TerminateBrowserSession(ctx context.Context, value, userID, clie
 		if err := tx.Delete(&session{}, "user_id = ?", userID).Error; err != nil {
 			return err
 		}
-		return tx.Delete(&refreshToken{}, "user_id = ? AND client_id = ?", userID, clientID).Error
+		// Updating family rows locks them against concurrent refresh rotation.
+		// Keep token hashes until the 90-day limit for replay detection.
+		return tx.Model(&refreshFamily{}).Where("user_id = ? AND client_id = ? AND revoked_at IS NULL", userID, clientID).
+			Update("revoked_at", time.Now().UTC()).Error
 	})
 }
 
