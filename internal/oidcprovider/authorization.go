@@ -12,20 +12,47 @@ import (
 	"gorm.io/gorm"
 )
 
+type browserBindingKey struct{}
+
+// NewBrowserBinding makes the opaque value kept in the browser during sign-in.
+func NewBrowserBinding() (string, error) { return randomString() }
+
+// WithBrowserBinding passes only the cookie hash to the provider's storage hook.
+func WithBrowserBinding(ctx context.Context, value string) context.Context {
+	if value == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, browserBindingKey{}, hash(value))
+}
+
 // CreateAuthRequest implements op.AuthStorage for /authorize. ZITADEL has
 // validated the app request; this inserts its pending state before /login.
 func (s *Store) CreateAuthRequest(ctx context.Context, incoming *oidc.AuthRequest, userID string) (op.AuthRequest, error) {
+	browserHash, ok := ctx.Value(browserBindingKey{}).(string)
+	if !ok || browserHash == "" {
+		return nil, errors.New("authorization browser binding missing")
+	}
 	a := &authRequest{
 		ID: uuid.NewString(), ClientID: incoming.ClientID, RedirectURI: incoming.RedirectURI,
 		State: incoming.State, Nonce: incoming.Nonce, Scopes: strings.Join(incoming.Scopes, " "),
 		ResponseType: string(incoming.ResponseType), ResponseMode: string(incoming.ResponseMode),
 		CodeChallenge: incoming.CodeChallenge, CodeChallengeMethod: string(incoming.CodeChallengeMethod),
-		UserID: userID, CreatedAt: time.Now().UTC(),
+		UserID: userID, BrowserHash: browserHash, CreatedAt: time.Now().UTC(),
 	}
 	if err := s.db.WithContext(ctx).Create(a).Error; err != nil {
 		return nil, err
 	}
 	return a, nil
+}
+
+// AuthRequestForBrowser loads a request only for the browser that started it.
+func (s *Store) AuthRequestForBrowser(ctx context.Context, id, value string) (op.AuthRequest, error) {
+	if value == "" {
+		return nil, gorm.ErrRecordNotFound
+	}
+	var a authRequest
+	err := s.db.WithContext(ctx).First(&a, "id = ? AND browser_hash = ? AND created_at > ?", id, hash(value), time.Now().UTC().Add(-AuthRequestLifetime)).Error
+	return &a, err
 }
 
 // AuthRequestByID loads a pending or completed request while it is still fresh.
@@ -129,9 +156,12 @@ func (s *Store) CompleteGoogle(ctx context.Context, state, userID string) (strin
 
 // RequestIDForGoogleState checks that Google's returned state still belongs to
 // an unfinished request before /auth/callback exchanges Google's code.
-func (s *Store) RequestIDForGoogleState(ctx context.Context, state string) (string, error) {
+func (s *Store) RequestIDForGoogleState(ctx context.Context, state, browserValue string) (string, error) {
+	if browserValue == "" {
+		return "", gorm.ErrRecordNotFound
+	}
 	var a authRequest
-	err := s.db.WithContext(ctx).First(&a, "google_state_hash = ? AND created_at > ? AND done = false", hash(state), time.Now().UTC().Add(-AuthRequestLifetime)).Error
+	err := s.db.WithContext(ctx).First(&a, "google_state_hash = ? AND browser_hash = ? AND created_at > ? AND done = false", hash(state), hash(browserValue), time.Now().UTC().Add(-AuthRequestLifetime)).Error
 	return a.ID, err
 }
 

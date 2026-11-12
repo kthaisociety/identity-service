@@ -47,6 +47,7 @@ type authRequest struct {
 	CodeExpiresAt       *time.Time
 	CodeUsed            bool
 	GoogleStateHash     *string
+	BrowserHash         string
 }
 
 func (authRequest) TableName() string        { return "oidc_auth_requests" }
