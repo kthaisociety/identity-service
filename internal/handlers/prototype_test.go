@@ -116,8 +116,7 @@ func pathFromLocation(t *testing.T, w *httptest.ResponseRecorder) string {
 	return u.RequestURI()
 }
 
-func (p *prototype) authorize(t *testing.T) (string, string) {
-	t.Helper()
+func authorizationQuery() (url.Values, string) {
 	verifier := "a-very-long-pkce-verifier-created-by-the-client"
 	digest := sha256.Sum256([]byte(verifier))
 	query := url.Values{
@@ -125,6 +124,12 @@ func (p *prototype) authorize(t *testing.T) (string, string) {
 		"scope": {"openid email offline_access"}, "state": {"app-state"},
 		"code_challenge": {base64.RawURLEncoding.EncodeToString(digest[:])}, "code_challenge_method": {"S256"},
 	}
+	return query, verifier
+}
+
+func (p *prototype) authorize(t *testing.T) (string, string) {
+	t.Helper()
+	query, verifier := authorizationQuery()
 	w := p.request(http.MethodGet, "/authorize?"+query.Encode(), nil, nil, "", "")
 	require.Equal(t, http.StatusFound, w.Code, w.Body.String())
 	var binding *http.Cookie
@@ -208,12 +213,6 @@ func TestOIDCFlowAndRefresh(t *testing.T) {
 	require.NoError(t, json.Unmarshal(keys.Body.Bytes(), &jwks))
 	require.Len(t, jwks.Keys, 1)
 	require.Equal(t, jose.RS256, jose.SignatureAlgorithm(jwks.Keys[0].Algorithm))
-	for _, control := range []string{"prompt=login", "max_age=0"} {
-		unsupported := p.request(http.MethodGet, "/authorize?"+control, nil, nil, "", "")
-		require.Equal(t, http.StatusBadRequest, unsupported.Code)
-		require.Contains(t, unsupported.Body.String(), "not supported")
-	}
-
 	code, cookie, verifier := p.signIn(t)
 	require.Equal(t, 1, p.google.calls)
 	response := p.exchange(code, verifier, "app", "secret", "http://127.0.0.1:8012/callback")
@@ -324,6 +323,49 @@ func TestOIDCFlowAndRefresh(t *testing.T) {
 	login = p.request(http.MethodGet, loginPath, nil, cookie, "", "")
 	require.Equal(t, http.StatusFound, login.Code)
 	require.Contains(t, login.Header().Get("Location"), "google.example/authorize")
+}
+
+func TestAuthorizeRejectsUnsupportedParsedOptions(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		extra string
+	}{
+		{"prompt", "prompt=login"},
+		{"mixed-case prompt", "PROMPT=login"},
+		{"max age", "max_age=0"},
+		{"mixed-case max age", "MAX_AGE=0"},
+		{"empty later challenge", "code_challenge="},
+		{"later plain method", "code_challenge_method=plain"},
+		{"fragment response", "response_mode=fragment"},
+		{"form response", "response_mode=form_post"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newPrototype(t)
+			query, _ := authorizationQuery()
+			response := p.request(http.MethodGet, "/authorize?"+query.Encode()+"&"+tc.extra, nil, nil, "", "")
+			require.Equal(t, http.StatusFound, response.Code, response.Body.String())
+			location, err := url.Parse(response.Header().Get("Location"))
+			require.NoError(t, err)
+			require.Equal(t, "http://127.0.0.1:8012/callback", location.Scheme+"://"+location.Host+location.Path)
+			errorCode := location.Query().Get("error")
+			if errorCode == "" {
+				fragment, err := url.ParseQuery(location.Fragment)
+				require.NoError(t, err)
+				errorCode = fragment.Get("error")
+			}
+			require.Equal(t, "invalid_request", errorCode)
+			var count int64
+			require.NoError(t, p.db.Raw("SELECT count(*) FROM oidc_auth_requests").Scan(&count).Error)
+			require.Zero(t, count)
+		})
+	}
+
+	p := newPrototype(t)
+	query, _ := authorizationQuery()
+	query.Set("response_mode", "query")
+	response := p.request(http.MethodGet, "/authorize?"+query.Encode(), nil, nil, "", "")
+	require.Equal(t, http.StatusFound, response.Code)
+	require.Equal(t, "/login", strings.Split(pathFromLocation(t, response), "?")[0])
 }
 
 func TestAuthorizationRequestRequiresStartingBrowser(t *testing.T) {
@@ -456,9 +498,12 @@ func TestSignInFailureLogsContainOnlyCategories(t *testing.T) {
 		logs := captureSafeLogs(t)
 		p := newPrototype(t)
 		logs.Reset()
-		w := p.request(http.MethodGet, "/authorize?code_challenge=challenge-sentinel&code_challenge_method=plain", nil, nil, "", "")
-		require.Equal(t, http.StatusBadRequest, w.Code)
-		requireFailureCategory(t, logs, "authorization_pkce_required", "challenge-sentinel")
+		query, _ := authorizationQuery()
+		query.Set("code_challenge", "challenge-sentinel")
+		query.Set("code_challenge_method", "plain")
+		w := p.request(http.MethodGet, "/authorize?"+query.Encode(), nil, nil, "", "")
+		require.Equal(t, http.StatusFound, w.Code)
+		requireFailureCategory(t, logs, "authorization_failed", "challenge-sentinel")
 	})
 
 	t.Run("Google state mismatch", func(t *testing.T) {
