@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -29,7 +30,11 @@ import (
 	"gorm.io/gorm"
 )
 
-type fakeGoogle struct{ calls int }
+type fakeGoogle struct {
+	calls   int
+	subject string
+	email   string
+}
 
 func (g *fakeGoogle) AuthURL(state string) string {
 	return "https://google.example/authorize?state=" + url.QueryEscape(state)
@@ -39,7 +44,11 @@ func (g *fakeGoogle) Exchange(_ context.Context, code string) (googleauth.Identi
 	if code != "valid" {
 		return googleauth.Identity{}, context.Canceled
 	}
-	return googleauth.Identity{Subject: "google-sub", Email: "person@example.com"}, nil
+	subject, email := g.subject, g.email
+	if subject == "" {
+		subject, email = "google-sub", "person@example.com"
+	}
+	return googleauth.Identity{Subject: subject, Email: email}, nil
 }
 
 type prototype struct {
@@ -85,6 +94,10 @@ func (p *prototype) request(method, path string, form url.Values, cookie *http.C
 }
 
 func (p *prototype) requestWithBrowser(method, path string, form url.Values, cookie, browser *http.Cookie, id, secret string) *httptest.ResponseRecorder {
+	return p.requestWithBrowserAndSite(method, path, form, cookie, browser, id, secret, "same-site")
+}
+
+func (p *prototype) requestWithBrowserAndSite(method, path string, form url.Values, cookie, browser *http.Cookie, id, secret, site string) *httptest.ResponseRecorder {
 	var body *strings.Reader
 	if form == nil {
 		body = strings.NewReader("")
@@ -94,6 +107,9 @@ func (p *prototype) requestWithBrowser(method, path string, form url.Values, coo
 	req := httptest.NewRequest(method, path, body)
 	if form != nil {
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
+	if site != "" {
+		req.Header.Set("Sec-Fetch-Site", site)
 	}
 	if cookie != nil {
 		req.AddCookie(cookie)
@@ -316,7 +332,8 @@ func TestOIDCFlowAndRefresh(t *testing.T) {
 		"grant_type": {"refresh_token"}, "refresh_token": {renewed.RefreshToken},
 	}, nil, "app", "secret").Code)
 
-	logout := p.request(http.MethodGet, "/end_session?client_id=app&post_logout_redirect_uri=http%3A%2F%2F127.0.0.1%3A8012%2F", nil, cookie, "", "")
+	logoutQuery := url.Values{"id_token_hint": {tokens.IDToken}, "post_logout_redirect_uri": {"http://127.0.0.1:8012/"}}
+	logout := p.request(http.MethodGet, "/end_session?"+logoutQuery.Encode(), nil, cookie, "", "")
 	require.Equal(t, http.StatusFound, logout.Code, logout.Body.String())
 	require.Equal(t, "http://127.0.0.1:8012/", logout.Header().Get("Location"))
 	loginPath, _ = p.authorize(t)
@@ -453,26 +470,198 @@ func TestAuthorizationRejectsWrongPKCEVerifier(t *testing.T) {
 	require.NotEqual(t, http.StatusOK, p.exchange(code, verifier, "app", "secret", "http://127.0.0.1:8012/callback").Code)
 }
 
-func TestLogoutWithIDTokenHintEndsSessionAndRefresh(t *testing.T) {
-	p := newPrototype(t)
+type logoutTokens struct {
+	IDToken      string `json:"id_token"`
+	RefreshToken string `json:"refresh_token"`
+}
+
+func (p *prototype) issueLogoutTokens(t *testing.T) (*http.Cookie, logoutTokens) {
+	t.Helper()
 	code, cookie, verifier := p.signIn(t)
 	issued := p.exchange(code, verifier, "app", "secret", "http://127.0.0.1:8012/callback")
-	require.Equal(t, http.StatusOK, issued.Code)
-	var tokens struct {
-		IDToken      string `json:"id_token"`
-		RefreshToken string `json:"refresh_token"`
-	}
+	require.Equal(t, http.StatusOK, issued.Code, issued.Body.String())
+	var tokens logoutTokens
 	require.NoError(t, json.Unmarshal(issued.Body.Bytes(), &tokens))
-	query := url.Values{"id_token_hint": {tokens.IDToken}, "post_logout_redirect_uri": {"http://127.0.0.1:8012/"}}
+	return cookie, tokens
+}
+
+func TestLogoutWithIDTokenHintEndsSessionAndRefresh(t *testing.T) {
+	p := newPrototype(t)
+	cookie, tokens := p.issueLogoutTokens(t)
+	// The same person can have another identity session, and an independent app
+	// can hold a refresh token. Logout must target the user's sessions and only
+	// the requesting app's refresh tokens.
+	secondCookie, secondTokens := p.issueLogoutTokens(t)
+	var userID string
+	require.NoError(t, p.db.Raw("SELECT id FROM users WHERE google_sub = ?", "google-sub").Scan(&userID).Error)
+	require.NoError(t, p.db.Exec(`INSERT INTO oidc_refresh_tokens
+		(token_hash, user_id, client_id, scopes, auth_time, expires_at)
+		VALUES (?, ?, ?, ?, now(), now() + interval '1 day')`,
+		"another-app-token", userID, "other", "openid").Error)
+	query := url.Values{"id_token_hint": {tokens.IDToken}, "post_logout_redirect_uri": {"http://127.0.0.1:8012/"}, "state": {"logout-state"}}
 	logout := p.request(http.MethodGet, "/end_session?"+query.Encode(), nil, cookie, "", "")
 	require.Equal(t, http.StatusFound, logout.Code, logout.Body.String())
-	require.Equal(t, "http://127.0.0.1:8012/", logout.Header().Get("Location"))
+	redirect, err := url.Parse(logout.Header().Get("Location"))
+	require.NoError(t, err)
+	require.Equal(t, "http://127.0.0.1:8012/", redirect.Scheme+"://"+redirect.Host+redirect.Path)
+	require.Equal(t, "logout-state", redirect.Query().Get("state"))
+	var sessions, appRefreshes, otherRefreshes int64
+	require.NoError(t, p.db.Raw("SELECT count(*) FROM oidc_sessions WHERE user_id = ?", userID).Scan(&sessions).Error)
+	require.NoError(t, p.db.Raw("SELECT count(*) FROM oidc_refresh_tokens WHERE user_id = ? AND client_id = 'app'", userID).Scan(&appRefreshes).Error)
+	require.NoError(t, p.db.Raw("SELECT count(*) FROM oidc_refresh_tokens WHERE user_id = ? AND client_id = 'other'", userID).Scan(&otherRefreshes).Error)
+	require.Zero(t, sessions)
+	require.Zero(t, appRefreshes)
+	require.EqualValues(t, 1, otherRefreshes)
 	loginPath, _ := p.authorize(t)
 	login := p.request(http.MethodGet, loginPath, nil, cookie, "", "")
+	require.Contains(t, login.Header().Get("Location"), "google.example/authorize")
+	login = p.request(http.MethodGet, loginPath, nil, secondCookie, "", "")
 	require.Contains(t, login.Header().Get("Location"), "google.example/authorize")
 	require.NotEqual(t, http.StatusOK, p.request(http.MethodPost, "/oauth/token", url.Values{
 		"grant_type": {"refresh_token"}, "refresh_token": {tokens.RefreshToken},
 	}, nil, "app", "secret").Code)
+	require.NotEqual(t, http.StatusOK, p.request(http.MethodPost, "/oauth/token", url.Values{
+		"grant_type": {"refresh_token"}, "refresh_token": {secondTokens.RefreshToken},
+	}, nil, "app", "secret").Code)
+}
+
+func TestRejectedLogoutPreservesSessionAndRefresh(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		call   func(*prototype, *http.Cookie, string) *httptest.ResponseRecorder
+	}{
+		{"no hint", http.StatusBadRequest, func(p *prototype, cookie *http.Cookie, _ string) *httptest.ResponseRecorder {
+			return p.request(http.MethodGet, "/end_session?client_id=app", nil, cookie, "", "")
+		}},
+		{"missing cookie", http.StatusBadRequest, func(p *prototype, _ *http.Cookie, hint string) *httptest.ResponseRecorder {
+			return p.request(http.MethodGet, "/end_session?id_token_hint="+url.QueryEscape(hint), nil, nil, "", "")
+		}},
+		{"wrong cookie", http.StatusBadRequest, func(p *prototype, cookie *http.Cookie, hint string) *httptest.ResponseRecorder {
+			wrong := *cookie
+			wrong.Value = "wrong-session"
+			return p.request(http.MethodGet, "/end_session?id_token_hint="+url.QueryEscape(hint), nil, &wrong, "", "")
+		}},
+		{"invalid hint", http.StatusBadRequest, func(p *prototype, cookie *http.Cookie, _ string) *httptest.ResponseRecorder {
+			return p.request(http.MethodGet, "/end_session?id_token_hint=invalid", nil, cookie, "", "")
+		}},
+		{"different client", http.StatusBadRequest, func(p *prototype, cookie *http.Cookie, hint string) *httptest.ResponseRecorder {
+			return p.request(http.MethodGet, "/end_session?client_id=other&id_token_hint="+url.QueryEscape(hint), nil, cookie, "", "")
+		}},
+		{"invalid redirect", http.StatusBadRequest, func(p *prototype, cookie *http.Cookie, hint string) *httptest.ResponseRecorder {
+			query := url.Values{"id_token_hint": {hint}, "post_logout_redirect_uri": {"https://unregistered.example/"}}
+			return p.request(http.MethodGet, "/end_session?"+query.Encode(), nil, cookie, "", "")
+		}},
+		{"cross site", http.StatusForbidden, func(p *prototype, cookie *http.Cookie, hint string) *httptest.ResponseRecorder {
+			return p.requestWithBrowserAndSite(http.MethodGet, "/end_session?id_token_hint="+url.QueryEscape(hint), nil, cookie, nil, "", "", "cross-site")
+		}},
+		{"cross site POST", http.StatusForbidden, func(p *prototype, cookie *http.Cookie, hint string) *httptest.ResponseRecorder {
+			return p.requestWithBrowserAndSite(http.MethodPost, "/end_session", url.Values{"id_token_hint": {hint}}, cookie, nil, "", "", "cross-site")
+		}},
+		{"unknown source", http.StatusForbidden, func(p *prototype, cookie *http.Cookie, hint string) *httptest.ResponseRecorder {
+			return p.requestWithBrowserAndSite(http.MethodGet, "/end_session?id_token_hint="+url.QueryEscape(hint), nil, cookie, nil, "", "", "")
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newPrototype(t)
+			cookie, tokens := p.issueLogoutTokens(t)
+			response := tc.call(p, cookie, tokens.IDToken)
+			require.Equal(t, tc.status, response.Code, response.Body.String())
+			require.Empty(t, response.Header().Values("Set-Cookie"))
+			var sessions, refreshes int64
+			require.NoError(t, p.db.Raw("SELECT count(*) FROM oidc_sessions").Scan(&sessions).Error)
+			require.NoError(t, p.db.Raw("SELECT count(*) FROM oidc_refresh_tokens").Scan(&refreshes).Error)
+			require.EqualValues(t, 1, sessions)
+			require.EqualValues(t, 1, refreshes)
+			renewed := p.request(http.MethodPost, "/oauth/token", url.Values{
+				"grant_type": {"refresh_token"}, "refresh_token": {tokens.RefreshToken},
+			}, nil, "app", "secret")
+			require.Equal(t, http.StatusOK, renewed.Code, renewed.Body.String())
+			valid := p.request(http.MethodGet, "/end_session?id_token_hint="+url.QueryEscape(tokens.IDToken), nil, cookie, "", "")
+			require.Equal(t, http.StatusFound, valid.Code, valid.Body.String())
+		})
+	}
+}
+
+func TestExpiredBrowserSessionCannotLogout(t *testing.T) {
+	p := newPrototype(t)
+	cookie, tokens := p.issueLogoutTokens(t)
+	require.NoError(t, p.db.Exec("UPDATE oidc_sessions SET expires_at = now() - interval '1 second'").Error)
+	response := p.request(http.MethodGet, "/end_session?id_token_hint="+url.QueryEscape(tokens.IDToken), nil, cookie, "", "")
+	require.Equal(t, http.StatusBadRequest, response.Code)
+	require.Empty(t, response.Header().Values("Set-Cookie"))
+	var refreshes int64
+	require.NoError(t, p.db.Raw("SELECT count(*) FROM oidc_refresh_tokens").Scan(&refreshes).Error)
+	require.EqualValues(t, 1, refreshes)
+}
+
+func TestLogoutHintMustMatchBrowserUser(t *testing.T) {
+	p := newPrototype(t)
+	firstCookie, _ := p.issueLogoutTokens(t)
+	p.google.subject, p.google.email = "another-google-sub", "another@example.com"
+	secondCookie, tokens := p.issueLogoutTokens(t)
+	response := p.request(http.MethodGet, "/end_session?id_token_hint="+url.QueryEscape(tokens.IDToken), nil, firstCookie, "", "")
+	require.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+	require.Empty(t, response.Header().Values("Set-Cookie"))
+	var sessions, refreshes int64
+	require.NoError(t, p.db.Raw("SELECT count(*) FROM oidc_sessions").Scan(&sessions).Error)
+	require.NoError(t, p.db.Raw("SELECT count(*) FROM oidc_refresh_tokens").Scan(&refreshes).Error)
+	require.EqualValues(t, 2, sessions)
+	require.EqualValues(t, 2, refreshes)
+	require.NotEqual(t, firstCookie.Value, secondCookie.Value)
+}
+
+func TestLogoutAcceptsPOST(t *testing.T) {
+	p := newPrototype(t)
+	cookie, tokens := p.issueLogoutTokens(t)
+	response := p.request(http.MethodPost, "/end_session", url.Values{
+		"id_token_hint": {tokens.IDToken}, "post_logout_redirect_uri": {"http://127.0.0.1:8012/"},
+	}, cookie, "", "")
+	require.Equal(t, http.StatusFound, response.Code, response.Body.String())
+	require.Equal(t, "http://127.0.0.1:8012/", response.Header().Get("Location"))
+	require.NotEmpty(t, response.Header().Values("Set-Cookie"))
+	var sessions int64
+	require.NoError(t, p.db.Raw("SELECT count(*) FROM oidc_sessions").Scan(&sessions).Error)
+	require.Zero(t, sessions)
+}
+
+func TestLogoutStoreFailureRollsBack(t *testing.T) {
+	logs := captureSafeLogs(t)
+	p := newPrototype(t)
+	cookie, tokens := p.issueLogoutTokens(t)
+	require.NoError(t, p.db.Exec(`CREATE FUNCTION reject_refresh_delete() RETURNS trigger
+		LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'rollback-sentinel'; END; $$`).Error)
+	require.NoError(t, p.db.Exec(`CREATE TRIGGER reject_refresh_delete BEFORE DELETE ON oidc_refresh_tokens
+		FOR EACH ROW EXECUTE FUNCTION reject_refresh_delete()`).Error)
+	logs.Reset()
+	response := p.request(http.MethodGet, "/end_session?id_token_hint="+url.QueryEscape(tokens.IDToken), nil, cookie, "", "")
+	require.Equal(t, http.StatusInternalServerError, response.Code)
+	require.Empty(t, response.Header().Values("Set-Cookie"))
+	require.NotContains(t, response.Body.String(), "rollback-sentinel")
+	requireFailureCategory(t, logs, "logout_store_failed", "rollback-sentinel", tokens.IDToken)
+	var sessions, refreshes int64
+	require.NoError(t, p.db.Raw("SELECT count(*) FROM oidc_sessions").Scan(&sessions).Error)
+	require.NoError(t, p.db.Raw("SELECT count(*) FROM oidc_refresh_tokens").Scan(&refreshes).Error)
+	require.EqualValues(t, 1, sessions)
+	require.EqualValues(t, 1, refreshes)
+}
+
+func TestParallelLogoutUsesSessionOnce(t *testing.T) {
+	p := newPrototype(t)
+	cookie, tokens := p.issueLogoutTokens(t)
+	path := "/end_session?id_token_hint=" + url.QueryEscape(tokens.IDToken)
+	results := make(chan int, 2)
+	for range 2 {
+		go func() { results <- p.request(http.MethodGet, path, nil, cookie, "", "").Code }()
+	}
+	statuses := []int{<-results, <-results}
+	slices.Sort(statuses)
+	require.Equal(t, []int{http.StatusFound, http.StatusBadRequest}, statuses)
+	var sessions, refreshes int64
+	require.NoError(t, p.db.Raw("SELECT count(*) FROM oidc_sessions").Scan(&sessions).Error)
+	require.NoError(t, p.db.Raw("SELECT count(*) FROM oidc_refresh_tokens").Scan(&refreshes).Error)
+	require.Zero(t, sessions)
+	require.Zero(t, refreshes)
 }
 
 func requireFailureCategory(t *testing.T, logs *bytes.Buffer, category string, secrets ...string) {

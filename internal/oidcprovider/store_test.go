@@ -117,9 +117,14 @@ func TestRefreshTokenRotatesAndSessionEnds(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, id, actual)
 	require.WithinDuration(t, authTime, restoredAuthTime, time.Microsecond)
-	require.NoError(t, s.EndSession(ctx, cookie))
+	require.Error(t, s.TerminateSession(ctx, id, "app"), "the provider hook cannot log out without browser validation")
+	_, _, err = s.SessionUser(ctx, cookie)
+	require.NoError(t, err)
+	require.NoError(t, s.TerminateBrowserSession(ctx, cookie, id, "app"))
 	_, _, err = s.SessionUser(ctx, cookie)
 	require.Error(t, err)
+	_, err = s.TokenRequestByRefreshToken(ctx, second)
+	require.True(t, errors.Is(err, op.ErrInvalidRefreshToken))
 }
 
 func TestExpiredCredentialsAreRejected(t *testing.T) {

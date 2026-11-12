@@ -14,7 +14,13 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/kthaisociety/identity-service/internal/googleauth"
 	"github.com/kthaisociety/identity-service/internal/oidcprovider"
+	"github.com/zitadel/oidc/v3/pkg/op"
 )
+
+type oidcProvider interface {
+	http.Handler
+	op.SessionEnder
+}
 
 // Deps holds the services used by the public and internal routers.
 // Provider runs OIDC with apps; AuthStore holds KTHAIS state; Google verifies the person;
@@ -22,7 +28,7 @@ import (
 type Deps struct {
 	PingDB        func(ctx context.Context) error
 	ServiceSecret string
-	Provider      http.Handler
+	Provider      oidcProvider
 	AuthStore     *oidcprovider.Store
 	Google        interface {
 		AuthURL(string) string
@@ -71,6 +77,7 @@ func NewPublicRouter(d Deps) *gin.Engine {
 		})
 
 		r.GET("/end_session", endSession(d))
+		r.POST("/end_session", endSession(d))
 		// These OIDC routes need no identity handler logic; Gin passes each
 		// request to the provider's handler for that path.
 		for _, path := range []string{
@@ -267,15 +274,53 @@ func googleCallback(d Deps) gin.HandlerFunc {
 	}
 }
 
-// endSession clears our browser session, then lets ZITADEL validate the logout
-// request and redirect to an allowed app or /signed-out.
+// endSession uses ZITADEL to parse and validate the app's logout request. Only
+// a matching, live browser session may authorize the database changes.
 func endSession(d Deps) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if value, err := c.Cookie(sessionCookie); err == nil {
-			_ = d.AuthStore.EndSession(c.Request.Context(), value)
+		// A cross-site navigation can carry our Lax session cookie on a GET.
+		// Browsers set this header; fail closed when its provenance is unknown.
+		switch c.GetHeader("Sec-Fetch-Site") {
+		case "same-origin", "same-site", "none":
+		default:
+			reject(c, http.StatusForbidden, "logout_cross_site")
+			return
+		}
+		value, err := c.Cookie(sessionCookie)
+		if err != nil || value == "" {
+			reject(c, http.StatusBadRequest, "logout_session_invalid")
+			return
+		}
+		request, err := op.ParseEndSessionRequest(c.Request, d.Provider.Decoder())
+		if err != nil {
+			reject(c, http.StatusBadRequest, "logout_parse_invalid")
+			return
+		}
+		if request.IdTokenHint == "" {
+			reject(c, http.StatusBadRequest, "logout_hint_missing")
+			return
+		}
+		// The provider normally installs this context value in ServeHTTP. We
+		// validate here before deleting anything, so supply its configured issuer.
+		validated, err := op.ValidateEndSessionRequest(op.ContextWithIssuer(c.Request.Context(), d.Issuer), request, d.Provider)
+		if err != nil {
+			reject(c, http.StatusBadRequest, "logout_request_invalid")
+			return
+		}
+		if validated.UserID == "" || validated.ClientID == "" {
+			reject(c, http.StatusBadRequest, "logout_context_invalid")
+			return
+		}
+		if err := d.AuthStore.TerminateBrowserSession(c.Request.Context(), value, validated.UserID, validated.ClientID); err != nil {
+			if errors.Is(err, oidcprovider.ErrLogoutSessionMismatch) {
+				reject(c, http.StatusBadRequest, "logout_session_invalid")
+			} else {
+				reject(c, http.StatusInternalServerError, "logout_store_failed")
+			}
+			return
 		}
 		http.SetCookie(c.Writer, identityCookie(d, sessionCookie, "", "/", -1))
-		d.Provider.ServeHTTP(c.Writer, c.Request)
+		c.Redirect(http.StatusFound, validated.RedirectURI)
 	}
 }
 
