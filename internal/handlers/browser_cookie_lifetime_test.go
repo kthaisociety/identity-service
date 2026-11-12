@@ -88,6 +88,7 @@ func TestAuthorizationCodeClearsOnlyItsRequestCookie(t *testing.T) {
 
 func TestLogoutClearsAllPendingSignInCookies(t *testing.T) {
 	p := newPrototype(t)
+	session, tokens := p.issueLogoutTokens(t)
 	firstLogin, _ := p.authorize(t)
 	firstCookie := p.browserCookie
 	secondLogin, _ := p.authorize(t)
@@ -98,8 +99,13 @@ func TestLogoutClearsAllPendingSignInCookies(t *testing.T) {
 	require.NoError(t, err)
 	origin, err := url.Parse("http://127.0.0.1:8010/")
 	require.NoError(t, err)
-	jar.SetCookies(origin, []*http.Cookie{firstCookie, secondCookie})
-	logout := requestWithJar(p, jar, "/end_session")
+	jar.SetCookies(origin, []*http.Cookie{session, firstCookie, secondCookie})
+	rejected := requestWithJar(p, jar, "/end_session")
+	require.Equal(t, http.StatusBadRequest, rejected.Code)
+	require.Empty(t, rejected.Result().Cookies(), "rejected logout must not clear pending sign-ins")
+	require.Len(t, jar.Cookies(origin), 3)
+	logout := requestWithJar(p, jar, "/end_session?id_token_hint="+url.QueryEscape(tokens.IDToken))
+	require.Equal(t, http.StatusFound, logout.Code)
 	var cleared []string
 	for _, cookie := range logout.Result().Cookies() {
 		if strings.HasPrefix(cookie.Name, authBrowserCookie+"_") {

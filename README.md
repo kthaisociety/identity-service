@@ -97,9 +97,18 @@ This prototype rejects `prompt` (including `prompt=none`) and `max_age` until fo
 and silent login are implemented. Apps should request `offline_access` and have their backend renew tokens
 at `/oauth/token` with `grant_type=refresh_token`, rather than use silent iframe renewal.
 Apps verify access JWTs against `/keys`, including issuer, audience and expiry. Access tokens last one hour;
-refresh tokens rotate and expire after 30 days. The identity browser session lasts 12 hours.
-`/end_session` ends that browser session; apps must
-also clear their own sessions. See [`PROPOSAL.md`](PROPOSAL.md) for the rollout and landingpage cookie plan.
+refresh tokens rotate and expire after 30 days when the app requests `offline_access`. The identity browser
+session lasts 12 hours. On logout, the app backend uses its saved ID token as the logout hint, revokes its
+refresh token at `/revoke`, and clears its own session. It then sends the browser to `/end_session` with
+that ID token as `id_token_hint`; GET and POST are supported. Identity validates the hint, client and return
+URL before changing anything. A matching live
+identity session ends that user's identity sessions and the requesting app's refresh tokens. If the identity
+session has already expired, identity clears its browser cookies and redirects back without deleting records.
+Requests from unrelated sites, or without `Sec-Fetch-Site`, are rejected. For browser logout, hosted apps
+follow [app delivery](https://github.com/kthaisociety/infrastructure/blob/main/docs/app-delivery.md) and use
+HTTPS on `kthais.com` or a subdomain such as `lucid-staging.kthais.com`. The loopback `smoke-test`
+client cannot test logout against staging identity; use `lucid-staging` for that test. See
+[`PROPOSAL.md`](PROPOSAL.md) for the rollout and landingpage cookie plan.
 
 Failed sign-ins and recovered panics log a fixed category, listener, route pattern and status for staging
 diagnosis. Request values, personal data, raw errors and panic contents are excluded from these logs.

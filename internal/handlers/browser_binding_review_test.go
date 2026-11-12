@@ -123,6 +123,7 @@ func TestFirstSignInInTwoTabsKeepsBothRequestsUsable(t *testing.T) {
 func requestWithJar(p *prototype, jar http.CookieJar, path string) *httptest.ResponseRecorder {
 	requestURL, _ := url.Parse("http://127.0.0.1:8010" + path)
 	req := httptest.NewRequest(http.MethodGet, requestURL.String(), nil)
+	req.Header.Set("Sec-Fetch-Site", "same-site")
 	for _, cookie := range jar.Cookies(requestURL) {
 		req.AddCookie(cookie)
 	}
