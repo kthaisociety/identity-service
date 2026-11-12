@@ -27,7 +27,7 @@ import (
 var ErrAccountLinkRequired = errors.New("existing email needs an explicit Google account link")
 
 const (
-	// AuthRequestLifetime also sets the browser-bound Google state cookie's lifetime.
+	// AuthRequestLifetime also sets the authorization browser cookie's lifetime.
 	AuthRequestLifetime  = 10 * time.Minute
 	codeLifetime         = time.Minute
 	accessTokenLifetime  = time.Hour
