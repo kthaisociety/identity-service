@@ -10,7 +10,7 @@ Keep an opaque, random browser cookie on the identity domain. Store only its SHA
 
 At `/authorize`, identity sets one opaque, 10-minute `HttpOnly` browser cookie and stores only its hash on each pending authorization request. `/login`, the Google callback, and `/authorize/callback` require the matching cookie before using that request. The Google callback also requires the one-use state stored on the request. Reusing the same browser cookie across requests allows sign-ins in multiple tabs. This cookie is distinct from the SSO session cookie.
 
-`/end_session` removes the current session and clears the cookie. When the OIDC logout request contains a valid ID token hint, the provider also ends that user's identity sessions and the requesting client's refresh tokens. Already issued JWT access tokens remain valid until their one-hour expiry.
+`/end_session` accepts GET and POST requests with an ID token hint. ZITADEL validates the hint, client and redirect before our handler checks that the hinted user matches a live identity session cookie. Browser Fetch Metadata must show a same-site or user-initiated request. A valid logout atomically removes all of that user's identity sessions and the requesting app's refresh tokens, then clears the browser cookie. Rejected requests leave sessions and tokens intact. Already issued JWT access tokens remain valid until their one-hour expiry.
 
 ## Consequences
 - Postgres is required for sign-in and SSO.

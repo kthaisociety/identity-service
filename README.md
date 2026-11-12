@@ -98,8 +98,12 @@ behavior are implemented.
 The same token endpoint accepts `grant_type=refresh_token`. Apps verify access JWTs against `/keys`,
 including issuer, audience and expiry. Access tokens last one hour; refresh tokens rotate and expire after
 30 days when the app requests `offline_access` during authorization. The identity browser session lasts
-12 hours. `/end_session` ends that browser session; apps must
-also clear their own sessions. See [`PROPOSAL.md`](PROPOSAL.md) for the rollout and landingpage cookie plan.
+12 hours. For logout, an app sends the browser to `/end_session` with its ID token as `id_token_hint`;
+GET and POST are supported. Identity requires a matching live browser session and a same-site or
+user-initiated browser request (`Sec-Fetch-Site`; missing or cross-site values are rejected).
+Successful logout ends that user's identity sessions and the app's
+refresh tokens. Apps must also clear their own sessions. See [`PROPOSAL.md`](PROPOSAL.md) for the
+rollout and landingpage cookie plan.
 
 Failed sign-ins and recovered panics log a fixed category, listener, route pattern and status for staging
 diagnosis. Request values, personal data, raw errors and panic contents are excluded from these logs.

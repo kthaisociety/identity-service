@@ -10,7 +10,10 @@ import (
 	"github.com/zitadel/oidc/v3/pkg/oidc"
 	"github.com/zitadel/oidc/v3/pkg/op"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
+
+var ErrLogoutSessionMismatch = errors.New("logout session does not match")
 
 type browserBindingKey struct{}
 
@@ -220,26 +223,32 @@ func (s *Store) SessionUser(ctx context.Context, value string) (string, time.Tim
 	return row.UserID, row.AuthTime, err
 }
 
-// EndSession removes the browser's identity session by cookie hash at /end_session.
-func (s *Store) EndSession(ctx context.Context, value string) error {
-	if value == "" {
-		return nil
-	}
-	return s.db.WithContext(ctx).Delete(&session{}, "id_hash = ?", hash(value)).Error
-}
-
-// TerminateSession implements op.AuthStorage for ZITADEL's logout flow. With a
-// known user it removes their identity sessions and this app's refresh tokens.
-func (s *Store) TerminateSession(ctx context.Context, userID, clientID string) error {
-	// Logout without an ID token hint has no subject. The HTTP handler still
-	// removes the current browser session using its cookie.
-	if userID == "" {
-		return nil
+// TerminateBrowserSession atomically checks the live browser session against
+// ZITADEL's validated ID token hint, then ends all identity sessions for that
+// user and refresh tokens issued to the requesting app.
+func (s *Store) TerminateBrowserSession(ctx context.Context, value, userID, clientID string) error {
+	if value == "" || userID == "" || clientID == "" {
+		return ErrLogoutSessionMismatch
 	}
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var current session
+		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&current,
+			"id_hash = ? AND user_id = ? AND expires_at > ?", hash(value), userID, time.Now().UTC()).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrLogoutSessionMismatch
+		}
+		if err != nil {
+			return err
+		}
 		if err := tx.Delete(&session{}, "user_id = ?", userID).Error; err != nil {
 			return err
 		}
 		return tx.Delete(&refreshToken{}, "user_id = ? AND client_id = ?", userID, clientID).Error
 	})
+}
+
+// TerminateSession is required by op.AuthStorage. Logout must go through our
+// browser-bound handler, so a direct provider call cannot delete sessions.
+func (s *Store) TerminateSession(context.Context, string, string) error {
+	return ErrLogoutSessionMismatch
 }
