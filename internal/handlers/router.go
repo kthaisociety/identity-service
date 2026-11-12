@@ -43,18 +43,6 @@ func NewPublicRouter(d Deps) *gin.Engine {
 	r.GET("/health", health(d.PingDB))
 	if d.Provider != nil {
 		r.GET("/authorize", func(c *gin.Context) {
-			// The login UI does not yet implement forced reauthentication or
-			// silent login. Reject these controls instead of silently ignoring them.
-			if c.Request.URL.Query().Has("prompt") || c.Request.URL.Query().Has("max_age") {
-				markFailure(c, "authorization_unsupported")
-				c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "prompt and max_age are not supported"})
-				return
-			}
-			if c.Query("code_challenge") == "" || c.Query("code_challenge_method") != "S256" {
-				markFailure(c, "authorization_pkce_required")
-				c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "PKCE S256 required"})
-				return
-			}
 			// Keep one value across sign-ins in different tabs. The storage hook
 			// saves its hash with each authorization request.
 			browserValue, err := c.Cookie(browserCookieName(d))

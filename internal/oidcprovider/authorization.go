@@ -26,8 +26,12 @@ func WithBrowserBinding(ctx context.Context, value string) context.Context {
 }
 
 // CreateAuthRequest implements op.AuthStorage for /authorize. ZITADEL has
-// validated the app request; this inserts its pending state before /login.
+// validated the app request; we enforce the login UI's supported options on
+// the parsed values before inserting its pending state for /login.
 func (s *Store) CreateAuthRequest(ctx context.Context, incoming *oidc.AuthRequest, userID string) (op.AuthRequest, error) {
+	if err := validateAuthorizationRequest(incoming); err != nil {
+		return nil, err
+	}
 	browserHash, ok := ctx.Value(browserBindingKey{}).(string)
 	if !ok || browserHash == "" {
 		return nil, errors.New("authorization browser binding missing")
@@ -43,6 +47,19 @@ func (s *Store) CreateAuthRequest(ctx context.Context, incoming *oidc.AuthReques
 		return nil, err
 	}
 	return a, nil
+}
+
+func validateAuthorizationRequest(request *oidc.AuthRequest) error {
+	if len(request.Prompt) > 0 || request.MaxAge != nil {
+		return oidc.ErrInvalidRequest().WithDescription("prompt and max_age are not supported")
+	}
+	if request.CodeChallenge == "" || request.CodeChallengeMethod != oidc.CodeChallengeMethodS256 {
+		return oidc.ErrInvalidRequest().WithDescription("PKCE S256 required")
+	}
+	if request.ResponseMode != "" && request.ResponseMode != oidc.ResponseModeQuery {
+		return oidc.ErrInvalidRequest().WithDescription("response_mode is not supported")
+	}
+	return nil
 }
 
 // AuthRequestForBrowser loads a request only for the browser that started it.
