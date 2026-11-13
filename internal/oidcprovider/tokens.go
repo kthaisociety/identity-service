@@ -141,10 +141,11 @@ func (s *Store) TokenRequestByRefreshToken(ctx context.Context, value string) (o
 }
 
 // GetRefreshTokenInfo binds a presented token to its app and returns the stored
-// token hash as the identifier ZITADEL uses when revoking it.
+// hash for revocation. A used predecessor remains resolvable after its own
+// expiry so the current token in its family can still be revoked.
 func (s *Store) GetRefreshTokenInfo(ctx context.Context, clientID, value string) (string, string, error) {
 	var row refreshToken
-	err := s.db.WithContext(ctx).First(&row, "token_hash = ? AND client_id = ? AND expires_at > ?", hash(value), clientID, time.Now().UTC()).Error
+	err := s.db.WithContext(ctx).First(&row, "token_hash = ? AND client_id = ?", hash(value), clientID).Error
 	if err != nil {
 		return "", "", op.ErrInvalidRefreshToken
 	}

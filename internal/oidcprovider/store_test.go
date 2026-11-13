@@ -250,6 +250,8 @@ func TestRevokingUsedRefreshTokenEndsItsChain(t *testing.T) {
 	first := newRefreshChain(t, s, userID)
 	second := rotateRefresh(t, s, first)
 	independent := newRefreshChain(t, s, userID)
+	require.NoError(t, s.db.Model(&refreshToken{}).Where("token_hash = ?", hash(first)).
+		Update("expires_at", time.Now().UTC().Add(-time.Hour)).Error)
 
 	owner, tokenID, err := s.GetRefreshTokenInfo(ctx, "app", first)
 	require.NoError(t, err)

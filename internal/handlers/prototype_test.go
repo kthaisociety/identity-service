@@ -401,8 +401,7 @@ func TestRevokingUsedRefreshThroughEndpointEndsItsChain(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal(renewed.Body.Bytes(), &body))
 	require.NotEmpty(t, body.RefreshToken)
-	// ZITADEL's /revoke lookup ignores an individually expired token, then
-	// passes the raw value to RevokeToken. The used hash must still revoke R2.
+	// An expired predecessor must still identify and revoke its refresh family.
 	require.NoError(t, p.db.Exec("UPDATE oidc_refresh_tokens SET expires_at = now() - interval '1 day' WHERE used_at IS NOT NULL").Error)
 
 	revoked := p.request(http.MethodPost, "/revoke", url.Values{
