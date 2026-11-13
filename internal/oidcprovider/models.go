@@ -79,14 +79,29 @@ func (a *authRequest) Done() bool                         { return a.IsDone }
 
 var _ op.AuthRequest = (*authRequest)(nil)
 
+// refreshFamily tracks one sign-in's rotation chain. Locking this row makes
+// rotation, replay revocation, and logout agree on the chain's current state.
+type refreshFamily struct {
+	ID        string `gorm:"primaryKey;type:uuid"`
+	UserID    string `gorm:"type:uuid"`
+	ClientID  string
+	ExpiresAt time.Time
+	RevokedAt *time.Time
+}
+
+func (refreshFamily) TableName() string { return "oidc_refresh_families" }
+
 // refreshToken is a database row whose methods implement op.RefreshTokenRequest.
+// Used rows remain as hashes so a later replay can revoke their family.
 type refreshToken struct {
 	TokenHash string `gorm:"primaryKey"`
+	FamilyID  string `gorm:"type:uuid"`
 	UserID    string `gorm:"type:uuid"`
 	ClientID  string
 	Scopes    string
 	AuthTime  time.Time
 	ExpiresAt time.Time
+	UsedAt    *time.Time
 }
 
 func (refreshToken) TableName() string                   { return "oidc_refresh_tokens" }

@@ -12,7 +12,8 @@ import, Workspace administration and app integration are later rollout steps.
 
 1. Read [`CONTEXT.md`](CONTEXT.md) for the vocabulary.
 2. Read the decisions in [`docs/adr/`](docs/adr/), including the [OIDC library](docs/adr/0006-zitadel-oidc-provider-library.md),
-   [SSO sessions](docs/adr/0007-postgres-sso-sessions.md), and [signing key](docs/adr/0008-single-configured-signing-key.md).
+   [SSO sessions](docs/adr/0007-postgres-sso-sessions.md), [signing key](docs/adr/0008-single-configured-signing-key.md),
+   and [refresh-token policy](docs/adr/0009-refresh-token-rotation-and-replay.md).
 3. Look at the existing services below for behavior that later rollout steps must preserve.
 
 ### What exists today
@@ -96,8 +97,10 @@ starts at `/authorize`, visits Google through `/login`, and returns to `/auth/ca
 This prototype rejects `prompt` and `max_age` parameters until forced reauthentication and silent-login
 behavior are implemented.
 The same token endpoint accepts `grant_type=refresh_token`. Apps verify access JWTs against `/keys`,
-including issuer, audience and expiry. Access tokens last one hour; refresh tokens rotate and expire after
-30 days when the app requests `offline_access` during authorization. The identity browser session lasts
+including issuer, audience and expiry. Access tokens last one hour. When an app requests
+`offline_access`, refresh tokens rotate and each lasts at most 30 days; renewal stops 90 days after
+the original sign-in. Reusing a rotated refresh token revokes that sign-in's refresh-token chain; app
+backends must coordinate refreshes for each session. The identity browser session lasts
 12 hours. For logout, an app sends the browser to `/end_session` with its ID token as `id_token_hint`;
 GET and POST are supported. Identity requires a matching live browser session and a same-site or
 user-initiated browser request (`Sec-Fetch-Site`; missing or cross-site values are rejected).

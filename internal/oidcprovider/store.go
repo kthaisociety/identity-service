@@ -28,11 +28,12 @@ var ErrAccountLinkRequired = errors.New("existing email needs an explicit Google
 
 const (
 	// AuthRequestLifetime also sets the authorization browser cookie's lifetime.
-	AuthRequestLifetime  = 10 * time.Minute
-	codeLifetime         = time.Minute
-	accessTokenLifetime  = time.Hour
-	refreshTokenLifetime = 30 * 24 * time.Hour
-	SessionLifetime      = 12 * time.Hour
+	AuthRequestLifetime     = 10 * time.Minute
+	codeLifetime            = time.Minute
+	accessTokenLifetime     = time.Hour
+	refreshTokenLifetime    = 30 * 24 * time.Hour
+	refreshAbsoluteLifetime = 90 * 24 * time.Hour
+	SessionLifetime         = 12 * time.Hour
 )
 
 // signingKey implements op.SigningKey; publicKey implements op.Key.
