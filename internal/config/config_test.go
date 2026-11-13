@@ -42,3 +42,21 @@ func TestValidateRejectsWildcardClientRedirect(t *testing.T) {
 	c.ClientsJSON = `[{"id":"app","secret":"secret","redirect_uris":["https://*.example.com/callback"]}]`
 	assert.ErrorContains(t, c.Validate(), "redirect URI")
 }
+
+func TestValidateRejectsIssuerWithUserInfo(t *testing.T) {
+	c := validConfig()
+	c.Issuer = "https://operator:private-password@identity.example"
+	c.GoogleRedirectURI = "https://identity.example/auth/callback"
+	c.ClientsJSON = `[{"id":"app","secret":"secret","redirect_uris":["https://app.example/callback"]}]`
+
+	assert.ErrorContains(t, c.Validate(), "OIDC_ISSUER",
+		"an issuer must be an origin; credentials in it would be published in discovery")
+}
+
+func TestValidateRejectsGoogleCallbackWithUserInfo(t *testing.T) {
+	c := validConfig()
+	c.GoogleRedirectURI = "http://operator:private-password@127.0.0.1:8010/auth/callback"
+
+	assert.ErrorContains(t, c.Validate(), "GOOGLE_REDIRECT_URI",
+		"the callback must be the issuer plus /auth/callback")
+}

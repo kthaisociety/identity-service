@@ -93,11 +93,14 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("PUBLIC_PORT and INTERNAL_PORT must differ (both %s)", c.PublicPort)
 	}
 	issuer, err := url.Parse(c.Issuer)
-	if err != nil || issuer.Host == "" || (issuer.Scheme != "https" && !(issuer.Scheme == "http" && (issuer.Hostname() == "localhost" || issuer.Hostname() == "127.0.0.1"))) || issuer.RawQuery != "" || issuer.Fragment != "" || issuer.Path != "" {
+	if err != nil || issuer.Host == "" || issuer.User != nil ||
+		(issuer.Scheme != "https" && !(issuer.Scheme == "http" && (issuer.Hostname() == "localhost" || issuer.Hostname() == "127.0.0.1"))) ||
+		issuer.RawQuery != "" || issuer.Fragment != "" || issuer.Path != "" {
 		return fmt.Errorf("OIDC_ISSUER must be an HTTPS origin (HTTP is allowed only on localhost)")
 	}
 	redirect, err := url.Parse(c.GoogleRedirectURI)
-	if err != nil || redirect.Scheme != issuer.Scheme || redirect.Host != issuer.Host || redirect.Path != "/auth/callback" || redirect.RawQuery != "" || redirect.Fragment != "" {
+	if err != nil || redirect.User != nil || redirect.Scheme != issuer.Scheme || redirect.Host != issuer.Host ||
+		redirect.Path != "/auth/callback" || redirect.RawQuery != "" || redirect.Fragment != "" {
 		return fmt.Errorf("GOOGLE_REDIRECT_URI must be OIDC_ISSUER plus /auth/callback")
 	}
 	if _, err := base64.StdEncoding.DecodeString(c.SigningKeyPEMBase64); err != nil {
