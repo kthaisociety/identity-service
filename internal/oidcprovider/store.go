@@ -165,25 +165,40 @@ func (s *Store) Health(ctx context.Context) error {
 	return sqlDB.PingContext(ctx)
 }
 
-// userInfo reads KTHAIS identity and roles for the userinfo and token-claim
-// hooks below. Google does not supply KTHAIS roles.
-func (s *Store) userInfo(ctx context.Context, info *oidc.UserInfo, userID string) error {
+// loadUserClaims reads KTHAIS identity and roles. Google does not supply
+// KTHAIS roles.
+func (s *Store) loadUserClaims(ctx context.Context, userID string) (refreshClaims, error) {
 	var u user
 	if err := s.db.WithContext(ctx).First(&u, "id = ?", userID).Error; err != nil {
-		return err
+		return refreshClaims{}, err
 	}
 	var roles []userRole
 	if err := s.db.WithContext(ctx).Find(&roles, "user_id = ?", userID).Error; err != nil {
-		return err
+		return refreshClaims{}, err
 	}
 	roleNames := make([]string, len(roles))
 	for i, role := range roles {
 		roleNames[i] = role.Role
 	}
-	info.Subject = u.ID
-	info.Email = u.Email
+	return refreshClaims{subject: u.ID, email: u.Email, roles: roleNames}, nil
+}
+
+// userInfo supplies claims to ZITADEL's token and userinfo hooks. A refresh
+// reuses claims loaded before rotation, avoiding a database failure after the
+// old token has already been consumed.
+func (s *Store) userInfo(ctx context.Context, info *oidc.UserInfo, userID string) error {
+	claims, ok := cachedRefreshClaims(ctx, userID)
+	if !ok {
+		var err error
+		claims, err = s.loadUserClaims(ctx, userID)
+		if err != nil {
+			return err
+		}
+	}
+	info.Subject = claims.subject
+	info.Email = claims.email
 	info.EmailVerified = true
-	info.AppendClaims("roles", roleNames)
+	info.AppendClaims("roles", append([]string(nil), claims.roles...))
 	return nil
 }
 

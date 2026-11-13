@@ -126,6 +126,35 @@ func TestRefreshTokenRotatesAndSessionEnds(t *testing.T) {
 	require.True(t, errors.Is(err, op.ErrInvalidRefreshToken))
 }
 
+func TestRefreshClaimsAreLoadedBeforeRotation(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	userID, err := s.FindOrCreateGoogleUser(ctx, "google-1", "person@example.com")
+	require.NoError(t, err)
+	first := newRefreshChain(t, s, userID)
+	ctx, state := TrackRefreshRequest(ctx)
+	request, err := s.TokenRequestByRefreshToken(ctx, first)
+	require.NoError(t, err)
+	require.False(t, state.StorageFailed())
+
+	// Token creation must not need another roles query after the old refresh
+	// token is consumed. The request-local snapshot supplies both JWT hooks.
+	require.NoError(t, s.db.Exec("ALTER TABLE user_roles RENAME TO user_roles_unavailable").Error)
+	t.Cleanup(func() {
+		require.NoError(t, s.db.Exec("ALTER TABLE user_roles_unavailable RENAME TO user_roles").Error)
+	})
+	_, _, _, err = s.CreateAccessAndRefreshTokens(ctx, request, first)
+	require.NoError(t, err)
+	info := new(oidc.UserInfo)
+	require.NoError(t, s.SetUserinfoFromScopes(ctx, info, userID, "", nil))
+	require.Equal(t, "person@example.com", info.Email)
+	require.Equal(t, []string{"user"}, info.Claims["roles"])
+	claims, err := s.GetPrivateClaimsFromScopes(ctx, userID, "", nil)
+	require.NoError(t, err)
+	require.Equal(t, "person@example.com", claims["email"])
+	require.Equal(t, []string{"user"}, claims["roles"])
+}
+
 func newRefreshChain(t *testing.T, s *Store, userID string) string {
 	t.Helper()
 	authTime := time.Now().UTC()

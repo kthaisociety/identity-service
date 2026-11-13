@@ -100,8 +100,10 @@ The same token endpoint accepts `grant_type=refresh_token`. Apps verify access J
 including issuer, audience and expiry. Access tokens last one hour. When an app requests
 `offline_access`, refresh tokens rotate and each lasts at most 30 days; renewal stops 90 days after
 the original sign-in. Reusing a rotated refresh token revokes that sign-in's refresh-token chain; app
-backends must coordinate refreshes for each session. The identity browser session lasts
-12 hours. For logout, an app sends the browser to `/end_session` with its ID token as `id_token_hint`;
+backends must coordinate refreshes for each session. A `503` from a refresh storage read occurs before
+rotation, so the app can keep that token and retry later.
+The identity browser session lasts 12 hours. For logout, an app sends the browser to `/end_session` with
+its ID token as `id_token_hint`;
 GET and POST are supported. Identity requires a matching live browser session and a same-site or
 user-initiated browser request (`Sec-Fetch-Site`; missing or cross-site values are rejected).
 Successful logout ends that user's identity sessions and the app's
