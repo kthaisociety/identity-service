@@ -348,6 +348,44 @@ func TestOIDCFlowAndRefresh(t *testing.T) {
 	require.Contains(t, login.Header().Get("Location"), "google.example/authorize")
 }
 
+func TestAuthorizationWithoutOfflineAccessDoesNotIssueRefreshToken(t *testing.T) {
+	p := newPrototype(t)
+	query, verifier := authorizationQuery()
+	query.Set("scope", "openid email")
+	started := p.request(http.MethodGet, "/authorize?"+query.Encode(), nil, nil, "", "")
+	require.Equal(t, http.StatusFound, started.Code, started.Body.String())
+	for _, cookie := range started.Result().Cookies() {
+		if cookie.Name == authBrowserCookie {
+			p.browserCookie = cookie
+		}
+	}
+	require.NotNil(t, p.browserCookie)
+	login := p.request(http.MethodGet, pathFromLocation(t, started), nil, nil, "", "")
+	require.Equal(t, http.StatusFound, login.Code)
+	googleURL, err := url.Parse(login.Header().Get("Location"))
+	require.NoError(t, err)
+	callback := p.request(http.MethodGet, "/auth/callback?state="+url.QueryEscape(googleURL.Query().Get("state"))+"&code=valid", nil, nil, "", "")
+	require.Equal(t, http.StatusFound, callback.Code, callback.Body.String())
+	issued := p.request(http.MethodGet, pathFromLocation(t, callback), nil, nil, "", "")
+	require.Equal(t, http.StatusFound, issued.Code, issued.Body.String())
+	appURL, err := url.Parse(issued.Header().Get("Location"))
+	require.NoError(t, err)
+	tokens := p.exchange(appURL.Query().Get("code"), verifier, "app", "secret", "http://127.0.0.1:8012/callback")
+	require.Equal(t, http.StatusOK, tokens.Code, tokens.Body.String())
+	var body struct {
+		AccessToken  string `json:"access_token"`
+		IDToken      string `json:"id_token"`
+		RefreshToken string `json:"refresh_token"`
+	}
+	require.NoError(t, json.Unmarshal(tokens.Body.Bytes(), &body))
+	require.NotEmpty(t, body.AccessToken)
+	require.NotEmpty(t, body.IDToken)
+	require.Empty(t, body.RefreshToken)
+	var count int64
+	require.NoError(t, p.db.Raw("SELECT count(*) FROM oidc_refresh_families").Scan(&count).Error)
+	require.Zero(t, count)
+}
+
 func TestRefreshRejectsOldOriginalSignIn(t *testing.T) {
 	p := newPrototype(t)
 	code, _, verifier := p.signIn(t)
@@ -409,6 +447,42 @@ func TestRevokingUsedRefreshThroughEndpointEndsItsChain(t *testing.T) {
 	}, nil, "app", "secret")
 	require.Equal(t, http.StatusOK, revoked.Code, revoked.Body.String())
 	require.Equal(t, http.StatusBadRequest, p.refresh(body.RefreshToken, "app", "secret").Code)
+}
+
+func TestRevocationStorageFailureCanBeRetried(t *testing.T) {
+	p := newPrototype(t)
+	_, tokens := p.issueLogoutTokens(t)
+	require.NoError(t, p.db.Exec("ALTER TABLE oidc_refresh_tokens RENAME TO oidc_refresh_tokens_unavailable").Error)
+	restored := false
+	t.Cleanup(func() {
+		if !restored {
+			require.NoError(t, p.db.Exec("ALTER TABLE oidc_refresh_tokens_unavailable RENAME TO oidc_refresh_tokens").Error)
+		}
+	})
+
+	form := url.Values{"token": {tokens.RefreshToken}, "token_type_hint": {"refresh_token"}}
+	failed := p.request(http.MethodPost, "/revoke", form, nil, "app", "secret")
+	require.GreaterOrEqual(t, failed.Code, http.StatusInternalServerError, failed.Body.String())
+	require.NotContains(t, failed.Body.String(), tokens.RefreshToken)
+	require.NotContains(t, failed.Body.String(), "oidc_refresh_tokens")
+	require.NoError(t, p.db.Exec("ALTER TABLE oidc_refresh_tokens_unavailable RENAME TO oidc_refresh_tokens").Error)
+	restored = true
+
+	revoked := p.request(http.MethodPost, "/revoke", form, nil, "app", "secret")
+	require.Equal(t, http.StatusOK, revoked.Code, revoked.Body.String())
+	require.Equal(t, http.StatusBadRequest, p.refresh(tokens.RefreshToken, "app", "secret").Code)
+}
+
+func TestOtherClientCannotRevokeRefreshFamily(t *testing.T) {
+	p := newPrototype(t)
+	_, tokens := p.issueLogoutTokens(t)
+	form := url.Values{"token": {tokens.RefreshToken}, "token_type_hint": {"refresh_token"}}
+	other := p.request(http.MethodPost, "/revoke", form, nil, "other", "other-secret")
+	require.Equal(t, http.StatusOK, other.Code, other.Body.String())
+	var liveFamilies int64
+	require.NoError(t, p.db.Raw("SELECT count(*) FROM oidc_refresh_families WHERE client_id = 'app' AND revoked_at IS NULL").Scan(&liveFamilies).Error)
+	require.EqualValues(t, 1, liveFamilies)
+	require.Equal(t, http.StatusOK, p.refresh(tokens.RefreshToken, "app", "secret").Code)
 }
 
 func TestRefreshReadFailuresAreRetryable(t *testing.T) {
@@ -573,6 +647,60 @@ func TestAuthorizationCallbacksRequireStartingBrowser(t *testing.T) {
 	issued := p.request(http.MethodGet, finishPath, nil, nil, "", "")
 	require.Equal(t, http.StatusFound, issued.Code)
 	require.NotEmpty(t, issued.Header().Get("Location"))
+}
+
+func TestExpiredAuthorizationRequestCannotContinue(t *testing.T) {
+	p := newPrototype(t)
+	state, browser, _ := p.beginGoogle(t)
+	var requestID string
+	require.NoError(t, p.db.Raw("SELECT id FROM oidc_auth_requests WHERE google_state_hash IS NOT NULL").Scan(&requestID).Error)
+	require.NotEmpty(t, requestID)
+	require.NoError(t, p.db.Exec("UPDATE oidc_auth_requests SET created_at = now() - interval '11 minutes' WHERE id = ?", requestID).Error)
+
+	login := p.request(http.MethodGet, "/login?authRequestID="+url.QueryEscape(requestID), nil, nil, "", "")
+	require.Equal(t, http.StatusBadRequest, login.Code)
+	callback := p.requestWithBrowser(http.MethodGet, "/auth/callback?state="+url.QueryEscape(state)+"&code=valid", nil, nil, browser, "", "")
+	require.Equal(t, http.StatusBadRequest, callback.Code)
+	require.Zero(t, p.google.calls, "an expired request must be rejected before exchanging Google's code")
+}
+
+func TestExpiredAuthorizationRequestCannotIssueAppCode(t *testing.T) {
+	p := newPrototype(t)
+	state, browser, _ := p.beginGoogle(t)
+	callback := p.request(http.MethodGet, "/auth/callback?state="+url.QueryEscape(state)+"&code=valid", nil, browser, "", "")
+	require.Equal(t, http.StatusFound, callback.Code)
+	finishPath := pathFromLocation(t, callback)
+	var requestID string
+	require.NoError(t, p.db.Raw("SELECT id FROM oidc_auth_requests WHERE done = true").Scan(&requestID).Error)
+	require.NotEmpty(t, requestID)
+	require.NoError(t, p.db.Exec("UPDATE oidc_auth_requests SET created_at = now() - interval '11 minutes' WHERE id = ?", requestID).Error)
+	issued := p.requestWithBrowser(http.MethodGet, finishPath, nil, nil, browser, "", "")
+	require.Equal(t, http.StatusBadRequest, issued.Code)
+	var count int64
+	require.NoError(t, p.db.Raw("SELECT count(*) FROM oidc_auth_requests WHERE id = ? AND code_hash IS NOT NULL", requestID).Scan(&count).Error)
+	require.Zero(t, count, "an expired request must not acquire an app code")
+}
+
+func TestRetryingLoginInvalidatesEarlierGoogleState(t *testing.T) {
+	p := newPrototype(t)
+	firstState, browser, _ := p.beginGoogle(t)
+	var requestID string
+	require.NoError(t, p.db.Raw("SELECT id FROM oidc_auth_requests WHERE google_state_hash IS NOT NULL").Scan(&requestID).Error)
+	require.NotEmpty(t, requestID)
+	retry := p.request(http.MethodGet, "/login?authRequestID="+url.QueryEscape(requestID), nil, nil, "", "")
+	require.Equal(t, http.StatusFound, retry.Code)
+	googleURL, err := url.Parse(retry.Header().Get("Location"))
+	require.NoError(t, err)
+	secondState := googleURL.Query().Get("state")
+	require.NotEmpty(t, secondState)
+	require.NotEqual(t, firstState, secondState)
+
+	oldCallback := p.request(http.MethodGet, "/auth/callback?state="+url.QueryEscape(firstState)+"&code=valid", nil, browser, "", "")
+	require.Equal(t, http.StatusBadRequest, oldCallback.Code)
+	require.Zero(t, p.google.calls, "superseded state must be rejected before exchanging Google's code")
+	currentCallback := p.request(http.MethodGet, "/auth/callback?state="+url.QueryEscape(secondState)+"&code=valid", nil, browser, "", "")
+	require.Equal(t, http.StatusFound, currentCallback.Code)
+	require.Equal(t, 1, p.google.calls)
 }
 
 func TestTwoTabsKeepTheSameBrowserBinding(t *testing.T) {
