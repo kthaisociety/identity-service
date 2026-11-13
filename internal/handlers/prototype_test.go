@@ -411,6 +411,79 @@ func TestRevokingUsedRefreshThroughEndpointEndsItsChain(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, p.refresh(body.RefreshToken, "app", "secret").Code)
 }
 
+func TestRefreshReadFailuresAreRetryable(t *testing.T) {
+	for _, table := range []string{"oidc_refresh_tokens", "oidc_refresh_families", "users", "user_roles"} {
+		t.Run(table, func(t *testing.T) {
+			p := newPrototype(t)
+			_, tokens := p.issueLogoutTokens(t)
+			hidden := table + "_unavailable"
+			require.NoError(t, p.db.Exec("ALTER TABLE "+table+" RENAME TO "+hidden).Error)
+			restored := false
+			t.Cleanup(func() {
+				if !restored {
+					require.NoError(t, p.db.Exec("ALTER TABLE "+hidden+" RENAME TO "+table).Error)
+				}
+			})
+
+			failed := p.refresh(tokens.RefreshToken, "app", "secret")
+			assertSafeTokenServerError(t, failed, http.StatusServiceUnavailable, tokens.RefreshToken)
+			require.NoError(t, p.db.Exec("ALTER TABLE "+hidden+" RENAME TO "+table).Error)
+			restored = true
+			require.Equal(t, http.StatusOK, p.refresh(tokens.RefreshToken, "app", "secret").Code,
+				"the same token must work after storage recovers")
+		})
+	}
+}
+
+func TestFailedRefreshRotationDoesNotConsumeToken(t *testing.T) {
+	p := newPrototype(t)
+	_, tokens := p.issueLogoutTokens(t)
+	const constraint = "reject_refresh_use"
+	require.NoError(t, p.db.Exec("ALTER TABLE oidc_refresh_tokens ADD CONSTRAINT "+constraint+" CHECK (used_at IS NULL)").Error)
+	removed := false
+	t.Cleanup(func() {
+		if !removed {
+			require.NoError(t, p.db.Exec("ALTER TABLE oidc_refresh_tokens DROP CONSTRAINT "+constraint).Error)
+		}
+	})
+
+	failed := p.refresh(tokens.RefreshToken, "app", "secret")
+	assertSafeTokenServerError(t, failed, http.StatusInternalServerError, tokens.RefreshToken)
+	var count, used int64
+	require.NoError(t, p.db.Raw("SELECT count(*) FROM oidc_refresh_tokens").Scan(&count).Error)
+	require.NoError(t, p.db.Raw("SELECT count(*) FROM oidc_refresh_tokens WHERE used_at IS NOT NULL").Scan(&used).Error)
+	require.EqualValues(t, 1, count, "a failed rotation must not issue a replacement")
+	require.Zero(t, used, "a failed rotation must not consume the original token")
+
+	require.NoError(t, p.db.Exec("ALTER TABLE oidc_refresh_tokens DROP CONSTRAINT "+constraint).Error)
+	removed = true
+	require.Equal(t, http.StatusOK, p.refresh(tokens.RefreshToken, "app", "secret").Code,
+		"the original token must work after storage recovers")
+}
+
+func TestInvalidRefreshTokensRemainInvalidGrants(t *testing.T) {
+	p := newPrototype(t)
+	missing := p.refresh("not-issued", "app", "secret")
+	require.Equal(t, http.StatusBadRequest, missing.Code)
+	require.Contains(t, missing.Body.String(), "invalid_grant")
+
+	_, tokens := p.issueLogoutTokens(t)
+	require.NoError(t, p.db.Exec("UPDATE oidc_refresh_tokens SET expires_at = now() - interval '1 second'").Error)
+	expired := p.refresh(tokens.RefreshToken, "app", "secret")
+	require.Equal(t, http.StatusBadRequest, expired.Code)
+	require.Contains(t, expired.Body.String(), "invalid_grant")
+}
+
+func assertSafeTokenServerError(t *testing.T, response *httptest.ResponseRecorder, status int, token string) {
+	t.Helper()
+	require.Equal(t, status, response.Code, response.Body.String())
+	require.JSONEq(t, `{"error":"server_error"}`, response.Body.String())
+	require.Equal(t, "no-store", response.Header().Get("Cache-Control"))
+	for _, sensitive := range []string{token, "secret", "oidc_refresh_tokens", "oidc_refresh_families", "invalid_grant"} {
+		require.NotContains(t, response.Body.String(), sensitive)
+	}
+}
+
 func TestAuthorizeRejectsUnsupportedParsedOptions(t *testing.T) {
 	for _, tc := range []struct {
 		name  string

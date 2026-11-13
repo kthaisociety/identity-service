@@ -29,7 +29,15 @@ func refreshLookupError(err error) error {
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return invalidRefreshGrant()
 	}
-	return err
+	return oidc.ErrServerError()
+}
+
+func refreshRequestLookupError(ctx context.Context, err error) error {
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return op.ErrInvalidRefreshToken
+	}
+	markRefreshStorageFailure(ctx)
+	return oidc.ErrServerError()
 }
 
 // CreateAccessAndRefreshTokens issues a new opaque refresh token for
@@ -52,7 +60,7 @@ func (s *Store) CreateAccessAndRefreshTokens(ctx context.Context, request op.Tok
 	}
 	value, err := randomString()
 	if err != nil {
-		return "", "", time.Time{}, err
+		return "", "", time.Time{}, oidc.ErrServerError()
 	}
 	row := refreshToken{
 		TokenHash: hash(value), UserID: request.GetSubject(), ClientID: clientRequest.GetClientID(),
@@ -112,7 +120,11 @@ func (s *Store) CreateAccessAndRefreshTokens(ctx context.Context, request op.Tok
 		return tx.Create(&row).Error
 	})
 	if err != nil {
-		return "", "", time.Time{}, err
+		var oauthErr *oidc.Error
+		if errors.As(err, &oauthErr) {
+			return "", "", time.Time{}, err
+		}
+		return "", "", time.Time{}, oidc.ErrServerError()
 	}
 	if replayed {
 		return "", "", time.Time{}, invalidRefreshGrant()
@@ -127,15 +139,23 @@ func (s *Store) TokenRequestByRefreshToken(ctx context.Context, value string) (o
 	var row refreshToken
 	now := time.Now().UTC()
 	if err := s.db.WithContext(ctx).First(&row, "token_hash = ?", hash(value)).Error; err != nil {
-		return nil, op.ErrInvalidRefreshToken
+		return nil, refreshRequestLookupError(ctx, err)
 	}
 	var family refreshFamily
 	if err := s.db.WithContext(ctx).First(&family, "id = ?", row.FamilyID).Error; err != nil {
-		return nil, op.ErrInvalidRefreshToken
+		return nil, refreshRequestLookupError(ctx, err)
 	}
 	if family.RevokedAt != nil || !now.Before(family.ExpiresAt) || !now.Before(row.AuthTime.Add(refreshAbsoluteLifetime)) ||
 		(row.UsedAt == nil && !now.Before(row.ExpiresAt)) {
 		return nil, op.ErrInvalidRefreshToken
+	}
+	if refreshState(ctx) != nil {
+		claims, err := s.loadUserClaims(ctx, row.UserID)
+		if err != nil {
+			markRefreshStorageFailure(ctx)
+			return nil, oidc.ErrServerError()
+		}
+		cacheRefreshClaims(ctx, claims)
 	}
 	return &row, nil
 }
