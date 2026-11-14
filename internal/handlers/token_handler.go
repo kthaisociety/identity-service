@@ -57,12 +57,27 @@ func tokenEndpoint(provider http.Handler) gin.HandlerFunc {
 		for name, values := range buffered.header {
 			c.Writer.Header()[name] = append([]string(nil), values...)
 		}
+		tokenCacheHeaders(c)
 		c.Status(status)
 		_, _ = c.Writer.Write(buffered.body.Bytes())
 	}
 }
 
 func tokenServerError(c *gin.Context, status int) {
-	c.Header("Cache-Control", "no-store")
+	tokenCacheHeaders(c)
 	c.AbortWithStatusJSON(status, gin.H{"error": "server_error"})
+}
+
+// withTokenCachePolicy covers early method errors and recovered panics too.
+func withTokenCachePolicy(next gin.HandlerFunc) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		tokenCacheHeaders(c)
+		next(c)
+	}
+}
+
+// tokenCacheHeaders prevents token responses from being stored by clients or proxies.
+func tokenCacheHeaders(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	c.Header("Pragma", "no-cache")
 }
