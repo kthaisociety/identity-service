@@ -553,6 +553,7 @@ func assertSafeTokenServerError(t *testing.T, response *httptest.ResponseRecorde
 	require.Equal(t, status, response.Code, response.Body.String())
 	require.JSONEq(t, `{"error":"server_error"}`, response.Body.String())
 	require.Equal(t, "no-store", response.Header().Get("Cache-Control"))
+	require.Equal(t, "no-cache", response.Header().Get("Pragma"))
 	for _, sensitive := range []string{token, "secret", "oidc_refresh_tokens", "oidc_refresh_families", "invalid_grant"} {
 		require.NotContains(t, response.Body.String(), sensitive)
 	}

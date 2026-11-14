@@ -78,12 +78,13 @@ func NewPublicRouter(d Deps) *gin.Engine {
 
 		r.GET("/end_session", endSession(d))
 		r.POST("/end_session", endSession(d))
-		r.Any("/oauth/token", tokenEndpoint(d.Provider))
+		r.Any("/oauth/token", withTokenCachePolicy(postOnly(tokenEndpoint(d.Provider))))
+		r.Any("/revoke", postOnly(gin.WrapH(d.Provider)))
 		// These OIDC routes need no identity handler logic; Gin passes each
 		// request to the provider's handler for that path.
 		for _, path := range []string{
 			"/.well-known/openid-configuration",
-			"/keys", "/userinfo", "/oauth/introspect", "/revoke",
+			"/keys", "/userinfo", "/oauth/introspect",
 		} {
 			r.Any(path, gin.WrapH(d.Provider))
 		}
@@ -116,6 +117,18 @@ func markFailure(c *gin.Context, category string) {
 func reject(c *gin.Context, status int, category string) {
 	markFailure(c, category)
 	c.AbortWithStatus(status)
+}
+
+// postOnly rejects other methods before ZITADEL can read query parameters.
+func postOnly(next gin.HandlerFunc) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.Method != http.MethodPost {
+			c.Header("Allow", http.MethodPost)
+			c.AbortWithStatus(http.StatusMethodNotAllowed)
+			return
+		}
+		next(c)
+	}
 }
 
 // failureLogging emits one category-only record after a failed sign-in route.
