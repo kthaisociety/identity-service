@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/kthaisociety/identity-service/internal/googleauth"
 	"github.com/kthaisociety/identity-service/internal/oidcprovider"
 )
@@ -55,30 +56,31 @@ func NewPublicRouter(d Deps) *gin.Engine {
 				c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "PKCE S256 required"})
 				return
 			}
-			// Keep one value across sign-ins in different tabs. The storage hook
-			// saves its hash with each authorization request.
-			browserValue, err := c.Cookie(browserCookieName(d))
-			if err != nil || browserValue == "" {
-				browserValue, err = oidcprovider.NewBrowserBinding()
-				if err != nil {
-					reject(c, http.StatusInternalServerError, "authorization_browser_failed")
-					return
-				}
+			// A separate cookie name for each request lets two first-time tabs
+			// keep their bindings even when both /authorize calls arrive at once.
+			requestID := uuid.NewString()
+			browserValue, err := oidcprovider.NewBrowserBinding()
+			if err != nil {
+				reject(c, http.StatusInternalServerError, "authorization_browser_failed")
+				return
 			}
-			http.SetCookie(c.Writer, identityCookie(d, browserCookieName(d), browserValue, "/", int(oidcprovider.AuthRequestLifetime.Seconds())))
-			c.Request = c.Request.WithContext(oidcprovider.WithBrowserBinding(c.Request.Context(), browserValue))
+			http.SetCookie(c.Writer, identityCookie(d, browserCookieName(d, requestID), browserValue, "/", int(oidcprovider.AuthRequestLifetime.Seconds())))
+			ctx := oidcprovider.WithBrowserBinding(c.Request.Context(), browserValue)
+			c.Request = c.Request.WithContext(oidcprovider.WithAuthRequestID(ctx, requestID))
 			// ZITADEL validates and stores the app request through AuthStore. On
 			// success it redirects the browser to /login?authRequestID=...
 			d.Provider.ServeHTTP(c.Writer, c.Request)
 		})
 		r.GET("/login", login(d))
 		r.GET("/auth/callback", googleCallback(d))
-		r.Any("/authorize/callback", func(c *gin.Context) {
-			browserValue, _ := c.Cookie(browserCookieName(d))
-			if _, err := d.AuthStore.AuthRequestForBrowser(c.Request.Context(), c.Query("id"), browserValue); err != nil {
+		r.GET("/authorize/callback", func(c *gin.Context) {
+			id := c.Query("id")
+			browserValue, _ := c.Cookie(browserCookieName(d, id))
+			if _, err := d.AuthStore.AuthRequestForBrowser(c.Request.Context(), id, browserValue); err != nil {
 				reject(c, http.StatusBadRequest, "authorization_browser_mismatch")
 				return
 			}
+			c.Request = c.Request.WithContext(oidcprovider.WithBrowserBinding(c.Request.Context(), browserValue))
 			d.Provider.ServeHTTP(c.Writer, c.Request)
 		})
 
@@ -103,11 +105,12 @@ const (
 	failureCategoryKey = "failure_category"
 )
 
-func browserCookieName(d Deps) string {
+func browserCookieName(d Deps, requestID string) string {
+	name := authBrowserCookie + "_" + requestID
 	if strings.HasPrefix(d.Issuer, "https://") {
-		return "__Host-" + authBrowserCookie
+		return "__Host-" + name
 	}
-	return authBrowserCookie
+	return name
 }
 
 // markFailure records only a fixed category. The middleware emits the event
@@ -201,13 +204,14 @@ func identityCookie(d Deps, name, value, path string, maxAge int) *http.Cookie {
 func login(d Deps) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		id := c.Query("authRequestID")
-		browserValue, _ := c.Cookie(browserCookieName(d))
+		browserValue, _ := c.Cookie(browserCookieName(d, id))
 		request, err := d.AuthStore.AuthRequestForBrowser(c.Request.Context(), id, browserValue)
 		if err != nil || request.Done() {
 			markFailure(c, "login_request_invalid")
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "invalid login request"})
 			return
 		}
+		c.Request = c.Request.WithContext(oidcprovider.WithBrowserBinding(c.Request.Context(), browserValue))
 		if cookie, err := c.Cookie(sessionCookie); err == nil {
 			if userID, authTime, err := d.AuthStore.SessionUser(c.Request.Context(), cookie); err == nil {
 				if err := d.AuthStore.CompleteSessionLogin(c.Request.Context(), id, userID, authTime); err != nil {
@@ -240,7 +244,12 @@ func googleCallback(d Deps) gin.HandlerFunc {
 			reject(c, http.StatusBadRequest, "google_callback_invalid")
 			return
 		}
-		browserValue, err := c.Cookie(browserCookieName(d))
+		id, err := d.AuthStore.AuthRequestIDByGoogleState(c.Request.Context(), state)
+		if err != nil {
+			reject(c, http.StatusBadRequest, "google_state_invalid")
+			return
+		}
+		browserValue, err := c.Cookie(browserCookieName(d, id))
 		if err != nil || browserValue == "" {
 			reject(c, http.StatusBadRequest, "google_state_mismatch")
 			return
@@ -249,6 +258,7 @@ func googleCallback(d Deps) gin.HandlerFunc {
 			reject(c, http.StatusBadRequest, "google_state_invalid")
 			return
 		}
+		c.Request = c.Request.WithContext(oidcprovider.WithBrowserBinding(c.Request.Context(), browserValue))
 		// This is Google's code; ZITADEL creates the separate app code later.
 		identity, err := d.Google.Exchange(c.Request.Context(), code)
 		if err != nil {

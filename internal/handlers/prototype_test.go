@@ -129,7 +129,7 @@ func (p *prototype) authorize(t *testing.T) (string, string) {
 	require.Equal(t, http.StatusFound, w.Code, w.Body.String())
 	var binding *http.Cookie
 	for _, cookie := range w.Result().Cookies() {
-		if cookie.Name == authBrowserCookie {
+		if strings.HasPrefix(cookie.Name, authBrowserCookie+"_") {
 			binding = cookie
 		}
 	}
@@ -149,7 +149,7 @@ func (p *prototype) beginGoogle(t *testing.T) (string, *http.Cookie, string) {
 	require.NoError(t, err)
 	state := googleURL.Query().Get("state")
 	require.NotEmpty(t, state)
-	require.Empty(t, login.Result().Cookies(), "the browser binding is reused across sign-ins")
+	require.Empty(t, login.Result().Cookies(), "login must not replace the request binding")
 	return state, p.browserCookie, verifier
 }
 
@@ -374,31 +374,37 @@ func TestAuthorizationCallbacksRequireStartingBrowser(t *testing.T) {
 	require.NotEmpty(t, issued.Header().Get("Location"))
 }
 
-func TestTwoTabsKeepTheSameBrowserBinding(t *testing.T) {
+func TestTwoTabsKeepTheirOwnBrowserBindings(t *testing.T) {
 	p := newPrototype(t)
 	_, session, _ := p.signIn(t)
 	first, _ := p.authorize(t)
-	value := p.browserCookie.Value
+	firstBrowser := p.browserCookie
 	second, _ := p.authorize(t)
-	require.Equal(t, value, p.browserCookie.Value)
-	for _, path := range []string{first, second} {
-		login := p.request(http.MethodGet, path, nil, session, "", "")
+	secondBrowser := p.browserCookie
+	require.NotEqual(t, firstBrowser.Name, secondBrowser.Name)
+	for _, tab := range []struct {
+		path    string
+		browser *http.Cookie
+	}{{first, firstBrowser}, {second, secondBrowser}} {
+		login := p.requestWithBrowser(http.MethodGet, tab.path, nil, session, tab.browser, "", "")
 		require.Equal(t, http.StatusFound, login.Code)
-		issued := p.request(http.MethodGet, pathFromLocation(t, login), nil, nil, "", "")
+		issued := p.requestWithBrowser(http.MethodGet, pathFromLocation(t, login), nil, nil, tab.browser, "", "")
 		require.Equal(t, http.StatusFound, issued.Code)
 	}
 }
 
 func TestTwoTabsCanFinishGoogleSignIn(t *testing.T) {
 	p := newPrototype(t)
-	firstState, _, _ := p.beginGoogle(t)
-	value := p.browserCookie.Value
-	secondState, _, _ := p.beginGoogle(t)
-	require.Equal(t, value, p.browserCookie.Value)
-	for _, state := range []string{firstState, secondState} {
-		callback := p.request(http.MethodGet, "/auth/callback?state="+url.QueryEscape(state)+"&code=valid", nil, nil, "", "")
+	firstState, firstBrowser, _ := p.beginGoogle(t)
+	secondState, secondBrowser, _ := p.beginGoogle(t)
+	require.NotEqual(t, firstBrowser.Name, secondBrowser.Name)
+	for _, tab := range []struct {
+		state   string
+		browser *http.Cookie
+	}{{firstState, firstBrowser}, {secondState, secondBrowser}} {
+		callback := p.requestWithBrowser(http.MethodGet, "/auth/callback?state="+url.QueryEscape(tab.state)+"&code=valid", nil, nil, tab.browser, "", "")
 		require.Equal(t, http.StatusFound, callback.Code)
-		issued := p.request(http.MethodGet, pathFromLocation(t, callback), nil, nil, "", "")
+		issued := p.requestWithBrowser(http.MethodGet, pathFromLocation(t, callback), nil, nil, tab.browser, "", "")
 		require.Equal(t, http.StatusFound, issued.Code)
 	}
 }
