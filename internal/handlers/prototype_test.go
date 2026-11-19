@@ -480,12 +480,26 @@ func TestSignInFailureLogsContainOnlyCategories(t *testing.T) {
 		requireFailureCategory(t, logs, "authorization_pkce_required", "challenge-sentinel")
 	})
 
-	t.Run("Google state mismatch", func(t *testing.T) {
+	t.Run("Google callback cookie missing", func(t *testing.T) {
 		logs := captureSafeLogs(t)
 		p := newPrototype(t)
 		state, _, _ := p.beginGoogle(t)
 		logs.Reset()
 		w := p.requestWithBrowser(http.MethodGet, "/auth/callback?state="+url.QueryEscape(state)+"&code=code-sentinel", nil, nil, nil, "", "")
+		require.Equal(t, http.StatusBadRequest, w.Code)
+		requireFailureCategory(t, logs, "google_cookie_missing", "code-sentinel", state)
+	})
+
+	t.Run("Google state mismatch", func(t *testing.T) {
+		logs := captureSafeLogs(t)
+		p := newPrototype(t)
+		state, browser, _ := p.beginGoogle(t)
+		wrong := *browser
+		otherValue, err := oidcprovider.NewBrowserBinding()
+		require.NoError(t, err)
+		wrong.Value = otherValue
+		logs.Reset()
+		w := p.requestWithBrowser(http.MethodGet, "/auth/callback?state="+url.QueryEscape(state)+"&code=code-sentinel", nil, nil, &wrong, "", "")
 		require.Equal(t, http.StatusBadRequest, w.Code)
 		requireFailureCategory(t, logs, "google_state_mismatch", "code-sentinel", state)
 	})

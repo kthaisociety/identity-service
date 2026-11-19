@@ -197,8 +197,8 @@ func providerFailureCategory(route string) string {
 	}
 }
 
-// identityCookie applies the browser cookie settings shared by SSO and Google
-// state; production cookies are Secure when the configured issuer uses HTTPS.
+// identityCookie applies shared settings to the SSO session and per-request
+// sign-in cookies. HTTPS issuers make these cookies Secure.
 func identityCookie(d Deps, name, value, path string, maxAge int) *http.Cookie {
 	return &http.Cookie{
 		Name: name, Value: value, Path: path, MaxAge: maxAge,
@@ -262,11 +262,11 @@ func googleCallback(d Deps) gin.HandlerFunc {
 		}
 		browserValue, err := c.Cookie(browserCookieName(d, id))
 		if err != nil || browserValue == "" {
-			reject(c, http.StatusBadRequest, "google_state_mismatch")
+			reject(c, http.StatusBadRequest, "google_cookie_missing")
 			return
 		}
 		if _, err := d.AuthStore.RequestIDForGoogleState(c.Request.Context(), state, browserValue); err != nil {
-			reject(c, http.StatusBadRequest, "google_state_invalid")
+			reject(c, http.StatusBadRequest, "google_state_mismatch")
 			return
 		}
 		c.Request = c.Request.WithContext(oidcprovider.WithBrowserBinding(c.Request.Context(), browserValue))
