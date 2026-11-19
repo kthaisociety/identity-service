@@ -27,6 +27,7 @@ import (
 var ErrAccountLinkRequired = errors.New("existing email needs an explicit Google account link")
 
 const (
+	randomStringBytes = 32
 	// AuthRequestLifetime also sets the authorization browser cookie's lifetime.
 	AuthRequestLifetime  = 10 * time.Minute
 	codeLifetime         = time.Minute
@@ -109,7 +110,7 @@ func parseSigningKey(encoded string) (signingKey, error) {
 
 // randomString and hash are local helpers for opaque values stored by their hashes.
 func randomString() (string, error) {
-	b := make([]byte, 32)
+	b := make([]byte, randomStringBytes)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}

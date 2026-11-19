@@ -2,6 +2,7 @@ package oidcprovider
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"strings"
 	"time"
@@ -35,10 +36,21 @@ func authRequestCookieHooks(ctx context.Context) AuthRequestCookieHooks {
 // NewBrowserBinding makes the opaque value kept in the browser during sign-in.
 func NewBrowserBinding() (string, error) { return randomString() }
 
+// ValidBrowserBinding accepts only the canonical form emitted by NewBrowserBinding.
+// Its shape does not prove who set the cookie; the stored hash provides the match.
+func ValidBrowserBinding(value string) bool {
+	if len(value) != base64.RawURLEncoding.EncodedLen(randomStringBytes) {
+		return false
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(value)
+	return err == nil && len(decoded) == randomStringBytes && base64.RawURLEncoding.EncodeToString(decoded) == value
+}
+
 // WithBrowserBinding passes only the cookie hash to the provider's storage hook.
 func WithBrowserBinding(ctx context.Context, value string) context.Context {
-	if value == "" {
-		return ctx
+	if !ValidBrowserBinding(value) {
+		// Do not retain an earlier binding if a caller supplies a bad cookie.
+		return context.WithValue(ctx, browserBindingKey{}, "")
 	}
 	return context.WithValue(ctx, browserBindingKey{}, hash(value))
 }
@@ -85,7 +97,7 @@ func (s *Store) CreateAuthRequest(ctx context.Context, incoming *oidc.AuthReques
 
 // AuthRequestForBrowser loads a request only for the browser that started it.
 func (s *Store) AuthRequestForBrowser(ctx context.Context, id, value string) (op.AuthRequest, error) {
-	if value == "" {
+	if !ValidBrowserBinding(value) {
 		return nil, gorm.ErrRecordNotFound
 	}
 	var a authRequest
@@ -223,7 +235,7 @@ func (s *Store) AuthRequestIDByGoogleState(ctx context.Context, state string) (s
 // RequestIDForGoogleState checks that Google's returned state still belongs to
 // an unfinished request before /auth/callback exchanges Google's code.
 func (s *Store) RequestIDForGoogleState(ctx context.Context, state, browserValue string) (string, error) {
-	if browserValue == "" {
+	if !ValidBrowserBinding(browserValue) {
 		return "", gorm.ErrRecordNotFound
 	}
 	var a authRequest

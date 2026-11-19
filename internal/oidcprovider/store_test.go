@@ -63,7 +63,7 @@ func TestGoogleUsersUseStableSubjectAndNeverAutoLinkEmail(t *testing.T) {
 
 func TestAuthorizationCodeIsSingleUse(t *testing.T) {
 	s := testStore(t)
-	ctx := WithBrowserBinding(context.Background(), "test-browser")
+	ctx := WithBrowserBinding(context.Background(), mustBrowserBinding(t))
 	_, err := s.CreateAuthRequest(context.Background(), &oidc.AuthRequest{}, "")
 	require.Error(t, err, "a request without a browser binding must not be stored")
 	a, err := s.CreateAuthRequest(ctx, &oidc.AuthRequest{
@@ -124,7 +124,7 @@ func TestRefreshTokenRotatesAndSessionEnds(t *testing.T) {
 
 func TestExpiredCredentialsAreRejected(t *testing.T) {
 	s := testStore(t)
-	ctx := WithBrowserBinding(context.Background(), "test-browser")
+	ctx := WithBrowserBinding(context.Background(), mustBrowserBinding(t))
 	id, err := s.FindOrCreateGoogleUser(ctx, "google-1", "person@example.com")
 	require.NoError(t, err)
 

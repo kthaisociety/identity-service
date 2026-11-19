@@ -84,8 +84,8 @@ func TestAuthorizationRequestWritesRequireStartingBrowser(t *testing.T) {
 func boundRequestForWriteTest(t *testing.T) (*Store, string, context.Context, []context.Context) {
 	t.Helper()
 	s := testStore(t)
-	right := WithBrowserBinding(context.Background(), "starting-browser")
-	wrong := WithBrowserBinding(context.Background(), "different-browser")
+	right := WithBrowserBinding(context.Background(), mustBrowserBinding(t))
+	wrong := WithBrowserBinding(context.Background(), mustBrowserBinding(t))
 	request, err := s.CreateAuthRequest(right, &oidc.AuthRequest{
 		ClientID: "app", RedirectURI: "http://127.0.0.1:8012/callback",
 		CodeChallenge: "challenge", CodeChallengeMethod: oidc.CodeChallengeMethodS256,

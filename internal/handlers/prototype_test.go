@@ -50,6 +50,10 @@ type prototype struct {
 }
 
 func newPrototype(t *testing.T) *prototype {
+	return newPrototypeWithIssuer(t, "http://127.0.0.1:8010")
+}
+
+func newPrototypeWithIssuer(t *testing.T, issuer string) *prototype {
 	t.Helper()
 	ginTestMode()
 	db := databasetest.Open(t)
@@ -57,12 +61,16 @@ func newPrototype(t *testing.T) *prototype {
 	require.NoError(t, err)
 	der, err := x509.MarshalPKCS8PrivateKey(key)
 	require.NoError(t, err)
+	appRedirectURI := "http://127.0.0.1:8012/callback"
+	if strings.HasPrefix(issuer, "https://") {
+		appRedirectURI = "https://app.example/callback"
+	}
 	cfg := &config.Config{
-		Issuer:              "http://127.0.0.1:8010",
+		Issuer:              issuer,
 		SigningKeyPEMBase64: base64.StdEncoding.EncodeToString(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})),
 		CryptoKeyBase64:     base64.StdEncoding.EncodeToString(make([]byte, 32)),
 		Clients: []config.Client{
-			{ID: "app", Secret: "secret", RedirectURIs: []string{"http://127.0.0.1:8012/callback"}, PostLogoutRedirectURIs: []string{"http://127.0.0.1:8012/"}},
+			{ID: "app", Secret: "secret", RedirectURIs: []string{appRedirectURI}, PostLogoutRedirectURIs: []string{"http://127.0.0.1:8012/"}},
 			{ID: "other", Secret: "other-secret", RedirectURIs: []string{"http://127.0.0.1:8013/callback"}},
 		},
 	}
@@ -360,6 +368,11 @@ func TestAuthorizationCallbacksRequireStartingBrowser(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, missing.Code)
 	wrong := *browser
 	wrong.Value = "wrong-browser"
+	malformed := p.requestWithBrowser(http.MethodGet, callbackPath, nil, nil, &wrong, "", "")
+	require.Equal(t, http.StatusBadRequest, malformed.Code)
+	wrongValue, err := oidcprovider.NewBrowserBinding()
+	require.NoError(t, err)
+	wrong.Value = wrongValue
 	mismatch := p.requestWithBrowser(http.MethodGet, callbackPath, nil, nil, &wrong, "", "")
 	require.Equal(t, http.StatusBadRequest, mismatch.Code)
 	require.Zero(t, p.google.calls, "Google code must not be exchanged for another browser")
