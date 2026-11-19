@@ -64,9 +64,14 @@ func NewPublicRouter(d Deps) *gin.Engine {
 				reject(c, http.StatusInternalServerError, "authorization_browser_failed")
 				return
 			}
-			http.SetCookie(c.Writer, identityCookie(d, browserCookieName(d, requestID), browserValue, "/", int(oidcprovider.AuthRequestLifetime.Seconds())))
 			ctx := oidcprovider.WithBrowserBinding(c.Request.Context(), browserValue)
-			c.Request = c.Request.WithContext(oidcprovider.WithAuthRequestID(ctx, requestID))
+			ctx = oidcprovider.WithAuthRequestID(ctx, requestID)
+			ctx = oidcprovider.WithAuthRequestCookieHooks(ctx, oidcprovider.AuthRequestCookieHooks{
+				Created: func() {
+					http.SetCookie(c.Writer, identityCookie(d, browserCookieName(d, requestID), browserValue, "/", int(oidcprovider.AuthRequestLifetime.Seconds())))
+				},
+			})
+			c.Request = c.Request.WithContext(ctx)
 			// ZITADEL validates and stores the app request through AuthStore. On
 			// success it redirects the browser to /login?authRequestID=...
 			d.Provider.ServeHTTP(c.Writer, c.Request)
@@ -80,7 +85,13 @@ func NewPublicRouter(d Deps) *gin.Engine {
 				reject(c, http.StatusBadRequest, "authorization_browser_mismatch")
 				return
 			}
-			c.Request = c.Request.WithContext(oidcprovider.WithBrowserBinding(c.Request.Context(), browserValue))
+			ctx := oidcprovider.WithBrowserBinding(c.Request.Context(), browserValue)
+			ctx = oidcprovider.WithAuthRequestCookieHooks(ctx, oidcprovider.AuthRequestCookieHooks{
+				CodeSaved: func() {
+					http.SetCookie(c.Writer, identityCookie(d, browserCookieName(d, id), "", "/", -1))
+				},
+			})
+			c.Request = c.Request.WithContext(ctx)
 			d.Provider.ServeHTTP(c.Writer, c.Request)
 		})
 
@@ -297,6 +308,19 @@ func endSession(d Deps) gin.HandlerFunc {
 			_ = d.AuthStore.EndSession(c.Request.Context(), value)
 		}
 		http.SetCookie(c.Writer, identityCookie(d, sessionCookie, "", "/", -1))
+		// Clear every pending sign-in from this browser, including other tabs.
+		// Request IDs are UUIDs, so only clear names we could have issued.
+		prefix := browserCookieName(d, "")
+		for _, cookie := range c.Request.Cookies() {
+			id, ok := strings.CutPrefix(cookie.Name, prefix)
+			if !ok {
+				continue
+			}
+			parsed, err := uuid.Parse(id)
+			if err == nil && parsed.String() == id {
+				http.SetCookie(c.Writer, identityCookie(d, cookie.Name, "", "/", -1))
+			}
+		}
 		d.Provider.ServeHTTP(c.Writer, c.Request)
 	}
 }

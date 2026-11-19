@@ -14,6 +14,23 @@ import (
 
 type browserBindingKey struct{}
 type authRequestIDKey struct{}
+type authRequestCookieHooksKey struct{}
+
+// AuthRequestCookieHooks lets the HTTP layer set and clear the request cookie
+// when ZITADEL's storage hooks confirm those lifecycle steps succeeded.
+type AuthRequestCookieHooks struct {
+	Created   func()
+	CodeSaved func()
+}
+
+func WithAuthRequestCookieHooks(ctx context.Context, hooks AuthRequestCookieHooks) context.Context {
+	return context.WithValue(ctx, authRequestCookieHooksKey{}, hooks)
+}
+
+func authRequestCookieHooks(ctx context.Context) AuthRequestCookieHooks {
+	hooks, _ := ctx.Value(authRequestCookieHooksKey{}).(AuthRequestCookieHooks)
+	return hooks
+}
 
 // NewBrowserBinding makes the opaque value kept in the browser during sign-in.
 func NewBrowserBinding() (string, error) { return randomString() }
@@ -59,6 +76,9 @@ func (s *Store) CreateAuthRequest(ctx context.Context, incoming *oidc.AuthReques
 	}
 	if err := s.db.WithContext(ctx).Create(a).Error; err != nil {
 		return nil, err
+	}
+	if notify := authRequestCookieHooks(ctx).Created; notify != nil {
+		notify()
 	}
 	return a, nil
 }
@@ -124,6 +144,9 @@ func (s *Store) SaveAuthCode(ctx context.Context, id, code string) error {
 	}
 	if result.RowsAffected != 1 {
 		return errors.New("authorization request is not ready")
+	}
+	if notify := authRequestCookieHooks(ctx).CodeSaved; notify != nil {
+		notify()
 	}
 	return nil
 }
