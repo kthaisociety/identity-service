@@ -44,18 +44,6 @@ func NewPublicRouter(d Deps) *gin.Engine {
 	r.GET("/health", health(d.PingDB))
 	if d.Provider != nil {
 		r.GET("/authorize", func(c *gin.Context) {
-			// The login UI does not yet implement forced reauthentication or
-			// silent login. Reject these controls instead of silently ignoring them.
-			if c.Request.URL.Query().Has("prompt") || c.Request.URL.Query().Has("max_age") {
-				markFailure(c, "authorization_unsupported")
-				c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "prompt and max_age are not supported"})
-				return
-			}
-			if c.Query("code_challenge") == "" || c.Query("code_challenge_method") != "S256" {
-				markFailure(c, "authorization_pkce_required")
-				c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "PKCE S256 required"})
-				return
-			}
 			// A separate cookie name for each request lets two first-time tabs
 			// keep their bindings even when both /authorize calls arrive at once.
 			requestID := uuid.NewString()
@@ -66,10 +54,11 @@ func NewPublicRouter(d Deps) *gin.Engine {
 			}
 			ctx := oidcprovider.WithBrowserBinding(c.Request.Context(), browserValue)
 			ctx = oidcprovider.WithAuthRequestID(ctx, requestID)
-			ctx = oidcprovider.WithAuthRequestCookieHooks(ctx, oidcprovider.AuthRequestCookieHooks{
+			ctx = oidcprovider.WithAuthRequestHooks(ctx, oidcprovider.AuthRequestHooks{
 				Created: func() {
 					http.SetCookie(c.Writer, identityCookie(d, browserCookieName(d, requestID), browserValue, "/", int(oidcprovider.AuthRequestLifetime.Seconds())))
 				},
+				Rejected: func(category string) { markFailure(c, category) },
 			})
 			c.Request = c.Request.WithContext(ctx)
 			// ZITADEL validates and stores the app request through AuthStore. On
@@ -86,7 +75,7 @@ func NewPublicRouter(d Deps) *gin.Engine {
 				return
 			}
 			ctx := oidcprovider.WithBrowserBinding(c.Request.Context(), browserValue)
-			ctx = oidcprovider.WithAuthRequestCookieHooks(ctx, oidcprovider.AuthRequestCookieHooks{
+			ctx = oidcprovider.WithAuthRequestHooks(ctx, oidcprovider.AuthRequestHooks{
 				CodeSaved: func() {
 					http.SetCookie(c.Writer, identityCookie(d, browserCookieName(d, id), "", "/", -1))
 				},

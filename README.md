@@ -93,12 +93,12 @@ All from env ([PCR 0001](docs/pcr/0001-config-from-env.md)); see `.env.example`.
 Discovery at `/.well-known/openid-configuration` advertises the library's endpoint URLs. The browser
 starts at `/authorize`, visits Google through `/login`, and returns to `/auth/callback`. The provider's
 `/authorize/callback` sends a one-use code to the app; its backend exchanges that code at `/oauth/token`.
-This prototype rejects `prompt` and `max_age` parameters until forced reauthentication and silent-login
-behavior are implemented.
-The same token endpoint accepts `grant_type=refresh_token`. Apps verify access JWTs against `/keys`,
-including issuer, audience and expiry. Access tokens last one hour; refresh tokens rotate and expire after
-30 days when the app requests `offline_access` during authorization. The identity browser session lasts
-12 hours. `/end_session` ends that browser session; apps must
+This prototype rejects `prompt` (including `prompt=none`) and `max_age` until forced reauthentication
+and silent login are implemented. Apps should request `offline_access` and have their backend renew tokens
+at `/oauth/token` with `grant_type=refresh_token`, rather than use silent iframe renewal.
+Apps verify access JWTs against `/keys`, including issuer, audience and expiry. Access tokens last one hour;
+refresh tokens rotate and expire after 30 days. The identity browser session lasts 12 hours.
+`/end_session` ends that browser session; apps must
 also clear their own sessions. See [`PROPOSAL.md`](PROPOSAL.md) for the rollout and landingpage cookie plan.
 
 Failed sign-ins and recovered panics log a fixed category, listener, route pattern and status for staging

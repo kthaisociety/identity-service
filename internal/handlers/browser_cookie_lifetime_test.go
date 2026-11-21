@@ -25,24 +25,31 @@ func authorizePathForCookieTest(clientID, redirectURI string) string {
 
 // Rejected OIDC requests must not leave a usable or orphaned browser cookie.
 func TestAuthorizeSetsCookieOnlyAfterRequestIsStored(t *testing.T) {
+	validPath := authorizePathForCookieTest("app", "http://127.0.0.1:8012/callback")
 	for _, tc := range []struct {
-		name, clientID, redirectURI string
+		name, path string
 	}{
-		{"unknown client", "unknown", "http://127.0.0.1:8012/callback"},
-		{"unregistered redirect", "app", "http://127.0.0.1:8012/unregistered"},
+		{"unknown client", authorizePathForCookieTest("unknown", "http://127.0.0.1:8012/callback")},
+		{"unregistered redirect", authorizePathForCookieTest("app", "http://127.0.0.1:8012/unregistered")},
+		{"empty later challenge", validPath + "&code_challenge="},
+		{"mixed-case prompt", validPath + "&PROMPT=login"},
+		{"fragment response", validPath + "&response_mode=fragment"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p := newPrototype(t)
-			w := p.requestWithBrowser(http.MethodGet, authorizePathForCookieTest(tc.clientID, tc.redirectURI), nil, nil, nil, "", "")
+			w := p.requestWithBrowser(http.MethodGet, tc.path, nil, nil, nil, "", "")
 			for _, cookie := range w.Result().Cookies() {
 				require.False(t, strings.HasPrefix(cookie.Name, authBrowserCookie+"_"), "rejected authorization set a request cookie")
 			}
 			require.NotContains(t, w.Header().Get("Location"), "/login?authRequestID=")
+			var count int64
+			require.NoError(t, p.db.Raw("SELECT count(*) FROM oidc_auth_requests").Scan(&count).Error)
+			require.Zero(t, count, "rejected authorization stored a request")
 		})
 	}
 
 	p := newPrototype(t)
-	w := p.requestWithBrowser(http.MethodGet, authorizePathForCookieTest("app", "http://127.0.0.1:8012/callback"), nil, nil, nil, "", "")
+	w := p.requestWithBrowser(http.MethodGet, validPath, nil, nil, nil, "", "")
 	require.Equal(t, http.StatusFound, w.Code)
 	require.Contains(t, w.Header().Get("Location"), "/login?authRequestID=")
 	var issued []*http.Cookie
