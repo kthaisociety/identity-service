@@ -54,10 +54,11 @@ func NewPublicRouter(d Deps) *gin.Engine {
 			}
 			ctx := oidcprovider.WithBrowserBinding(c.Request.Context(), browserValue)
 			ctx = oidcprovider.WithAuthRequestID(ctx, requestID)
-			ctx = oidcprovider.WithAuthRequestCookieHooks(ctx, oidcprovider.AuthRequestCookieHooks{
+			ctx = oidcprovider.WithAuthRequestHooks(ctx, oidcprovider.AuthRequestHooks{
 				Created: func() {
 					http.SetCookie(c.Writer, identityCookie(d, browserCookieName(d, requestID), browserValue, "/", int(oidcprovider.AuthRequestLifetime.Seconds())))
 				},
+				Rejected: func(category string) { markFailure(c, category) },
 			})
 			c.Request = c.Request.WithContext(ctx)
 			// ZITADEL validates and stores the app request through AuthStore. On
@@ -74,7 +75,7 @@ func NewPublicRouter(d Deps) *gin.Engine {
 				return
 			}
 			ctx := oidcprovider.WithBrowserBinding(c.Request.Context(), browserValue)
-			ctx = oidcprovider.WithAuthRequestCookieHooks(ctx, oidcprovider.AuthRequestCookieHooks{
+			ctx = oidcprovider.WithAuthRequestHooks(ctx, oidcprovider.AuthRequestHooks{
 				CodeSaved: func() {
 					http.SetCookie(c.Writer, identityCookie(d, browserCookieName(d, id), "", "/", -1))
 				},

@@ -15,21 +15,22 @@ import (
 
 type browserBindingKey struct{}
 type authRequestIDKey struct{}
-type authRequestCookieHooksKey struct{}
+type authRequestHooksKey struct{}
 
-// AuthRequestCookieHooks lets the HTTP layer set and clear the request cookie
-// when ZITADEL's storage hooks confirm those lifecycle steps succeeded.
-type AuthRequestCookieHooks struct {
+// AuthRequestHooks lets the HTTP layer handle request cookie changes and
+// record fixed rejection categories while the provider controls the flow.
+type AuthRequestHooks struct {
 	Created   func()
 	CodeSaved func()
+	Rejected  func(category string)
 }
 
-func WithAuthRequestCookieHooks(ctx context.Context, hooks AuthRequestCookieHooks) context.Context {
-	return context.WithValue(ctx, authRequestCookieHooksKey{}, hooks)
+func WithAuthRequestHooks(ctx context.Context, hooks AuthRequestHooks) context.Context {
+	return context.WithValue(ctx, authRequestHooksKey{}, hooks)
 }
 
-func authRequestCookieHooks(ctx context.Context) AuthRequestCookieHooks {
-	hooks, _ := ctx.Value(authRequestCookieHooksKey{}).(AuthRequestCookieHooks)
+func authRequestHooks(ctx context.Context) AuthRequestHooks {
+	hooks, _ := ctx.Value(authRequestHooksKey{}).(AuthRequestHooks)
 	return hooks
 }
 
@@ -72,7 +73,11 @@ func browserHashFromContext(ctx context.Context) (string, error) {
 // validated the app request; we enforce the login UI's supported options on
 // the parsed values before inserting its pending state for /login.
 func (s *Store) CreateAuthRequest(ctx context.Context, incoming *oidc.AuthRequest, userID string) (op.AuthRequest, error) {
-	if err := validateAuthorizationRequest(incoming); err != nil {
+	hooks := authRequestHooks(ctx)
+	if category, err := validateAuthorizationRequest(incoming); err != nil {
+		if hooks.Rejected != nil {
+			hooks.Rejected(category)
+		}
 		return nil, err
 	}
 	browserHash, err := browserHashFromContext(ctx)
@@ -93,23 +98,23 @@ func (s *Store) CreateAuthRequest(ctx context.Context, incoming *oidc.AuthReques
 	if err := s.db.WithContext(ctx).Create(a).Error; err != nil {
 		return nil, err
 	}
-	if notify := authRequestCookieHooks(ctx).Created; notify != nil {
+	if notify := hooks.Created; notify != nil {
 		notify()
 	}
 	return a, nil
 }
 
-func validateAuthorizationRequest(request *oidc.AuthRequest) error {
+func validateAuthorizationRequest(request *oidc.AuthRequest) (string, error) {
 	if len(request.Prompt) > 0 || request.MaxAge != nil {
-		return oidc.ErrInvalidRequest().WithDescription("prompt and max_age are not supported")
+		return "authorization_unsupported", oidc.ErrInvalidRequest().WithDescription("prompt and max_age are not supported")
 	}
 	if request.CodeChallenge == "" || request.CodeChallengeMethod != oidc.CodeChallengeMethodS256 {
-		return oidc.ErrInvalidRequest().WithDescription("PKCE S256 required")
+		return "authorization_pkce_required", oidc.ErrInvalidRequest().WithDescription("PKCE S256 required")
 	}
 	if request.ResponseMode != "" && request.ResponseMode != oidc.ResponseModeQuery {
-		return oidc.ErrInvalidRequest().WithDescription("response_mode is not supported")
+		return "authorization_unsupported", oidc.ErrInvalidRequest().WithDescription("response_mode is not supported")
 	}
-	return nil
+	return "", nil
 }
 
 // AuthRequestForBrowser loads a request only for the browser that started it.
@@ -174,7 +179,7 @@ func (s *Store) SaveAuthCode(ctx context.Context, id, code string) error {
 	if result.RowsAffected != 1 {
 		return errors.New("authorization request is not ready")
 	}
-	if notify := authRequestCookieHooks(ctx).CodeSaved; notify != nil {
+	if notify := authRequestHooks(ctx).CodeSaved; notify != nil {
 		notify()
 	}
 	return nil

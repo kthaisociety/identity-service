@@ -522,8 +522,30 @@ func TestSignInFailureLogsContainOnlyCategories(t *testing.T) {
 		query.Set("code_challenge_method", "plain")
 		w := p.request(http.MethodGet, "/authorize?"+query.Encode(), nil, nil, "", "")
 		require.Equal(t, http.StatusFound, w.Code)
-		requireFailureCategory(t, logs, "authorization_failed", "challenge-sentinel")
+		requireFailureCategory(t, logs, "authorization_pkce_required", "challenge-sentinel")
+		require.Equal(t, 1, bytes.Count(logs.Bytes(), []byte("sign_in_failed")))
 	})
+
+	for _, tc := range []struct {
+		name, key, value string
+	}{
+		{"silent prompt", "prompt", "none"},
+		{"maximum age", "max_age", "17"},
+		{"fragment response", "response_mode", "fragment"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := captureSafeLogs(t)
+			p := newPrototype(t)
+			logs.Reset()
+			query, _ := authorizationQuery()
+			query.Set("state", "state-sentinel")
+			query.Set(tc.key, tc.value)
+			w := p.request(http.MethodGet, "/authorize?"+query.Encode(), nil, nil, "", "")
+			require.Equal(t, http.StatusFound, w.Code)
+			requireFailureCategory(t, logs, "authorization_unsupported", "state-sentinel")
+			require.Equal(t, 1, bytes.Count(logs.Bytes(), []byte("sign_in_failed")))
+		})
+	}
 
 	t.Run("Google callback cookie missing", func(t *testing.T) {
 		logs := captureSafeLogs(t)
