@@ -43,12 +43,17 @@ func (g *fakeGoogle) Exchange(_ context.Context, code string) (googleauth.Identi
 }
 
 type prototype struct {
-	router http.Handler
-	db     *gorm.DB
-	google *fakeGoogle
+	router        http.Handler
+	db            *gorm.DB
+	google        *fakeGoogle
+	browserCookie *http.Cookie
 }
 
 func newPrototype(t *testing.T) *prototype {
+	return newPrototypeWithIssuer(t, "http://127.0.0.1:8010")
+}
+
+func newPrototypeWithIssuer(t *testing.T, issuer string) *prototype {
 	t.Helper()
 	ginTestMode()
 	db := databasetest.Open(t)
@@ -56,12 +61,16 @@ func newPrototype(t *testing.T) *prototype {
 	require.NoError(t, err)
 	der, err := x509.MarshalPKCS8PrivateKey(key)
 	require.NoError(t, err)
+	appRedirectURI := "http://127.0.0.1:8012/callback"
+	if strings.HasPrefix(issuer, "https://") {
+		appRedirectURI = "https://app.example/callback"
+	}
 	cfg := &config.Config{
-		Issuer:              "http://127.0.0.1:8010",
+		Issuer:              issuer,
 		SigningKeyPEMBase64: base64.StdEncoding.EncodeToString(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})),
 		CryptoKeyBase64:     base64.StdEncoding.EncodeToString(make([]byte, 32)),
 		Clients: []config.Client{
-			{ID: "app", Secret: "secret", RedirectURIs: []string{"http://127.0.0.1:8012/callback"}, PostLogoutRedirectURIs: []string{"http://127.0.0.1:8012/"}},
+			{ID: "app", Secret: "secret", RedirectURIs: []string{appRedirectURI}, PostLogoutRedirectURIs: []string{"http://127.0.0.1:8012/"}},
 			{ID: "other", Secret: "other-secret", RedirectURIs: []string{"http://127.0.0.1:8013/callback"}},
 		},
 	}
@@ -80,6 +89,10 @@ func newPrototype(t *testing.T) *prototype {
 func ginTestMode() { gin.SetMode(gin.TestMode) }
 
 func (p *prototype) request(method, path string, form url.Values, cookie *http.Cookie, id, secret string) *httptest.ResponseRecorder {
+	return p.requestWithBrowser(method, path, form, cookie, p.browserCookie, id, secret)
+}
+
+func (p *prototype) requestWithBrowser(method, path string, form url.Values, cookie, browser *http.Cookie, id, secret string) *httptest.ResponseRecorder {
 	var body *strings.Reader
 	if form == nil {
 		body = strings.NewReader("")
@@ -92,6 +105,9 @@ func (p *prototype) request(method, path string, form url.Values, cookie *http.C
 	}
 	if cookie != nil {
 		req.AddCookie(cookie)
+	}
+	if browser != nil && (cookie == nil || cookie.Name != browser.Name) {
+		req.AddCookie(browser)
 	}
 	if id != "" {
 		req.SetBasicAuth(id, secret)
@@ -119,6 +135,16 @@ func (p *prototype) authorize(t *testing.T) (string, string) {
 	}
 	w := p.request(http.MethodGet, "/authorize?"+query.Encode(), nil, nil, "", "")
 	require.Equal(t, http.StatusFound, w.Code, w.Body.String())
+	var binding *http.Cookie
+	for _, cookie := range w.Result().Cookies() {
+		if strings.HasPrefix(cookie.Name, authBrowserCookie+"_") {
+			binding = cookie
+		}
+	}
+	require.NotNil(t, binding)
+	require.True(t, binding.HttpOnly)
+	require.Equal(t, "/", binding.Path)
+	p.browserCookie = binding
 	return pathFromLocation(t, w), verifier
 }
 
@@ -131,26 +157,21 @@ func (p *prototype) beginGoogle(t *testing.T) (string, *http.Cookie, string) {
 	require.NoError(t, err)
 	state := googleURL.Query().Get("state")
 	require.NotEmpty(t, state)
-	stateCookies := login.Result().Cookies()
-	require.Len(t, stateCookies, 1)
-	require.Equal(t, googleStateCookie, stateCookies[0].Name)
-	require.True(t, stateCookies[0].HttpOnly)
-	require.Equal(t, "/auth/callback", stateCookies[0].Path)
-	require.Equal(t, http.SameSiteLaxMode, stateCookies[0].SameSite)
-	return state, stateCookies[0], verifier
+	require.Empty(t, login.Result().Cookies(), "login must not replace the request binding")
+	return state, p.browserCookie, verifier
 }
 
 func (p *prototype) signIn(t *testing.T) (string, *http.Cookie, string) {
 	t.Helper()
-	state, stateCookie, verifier := p.beginGoogle(t)
+	state, browserCookie, verifier := p.beginGoogle(t)
 	callbackPath := "/auth/callback?state=" + url.QueryEscape(state) + "&code=valid"
-	require.Equal(t, http.StatusBadRequest, p.request(http.MethodGet, callbackPath, nil, nil, "", "").Code)
-	wrongState := *stateCookie
-	wrongState.Value = "wrong"
-	require.Equal(t, http.StatusBadRequest, p.request(http.MethodGet, callbackPath, nil, &wrongState, "", "").Code)
-	callback := p.request(http.MethodGet, callbackPath, nil, stateCookie, "", "")
+	require.Equal(t, http.StatusBadRequest, p.requestWithBrowser(http.MethodGet, callbackPath, nil, nil, nil, "", "").Code)
+	wrongBrowser := *browserCookie
+	wrongBrowser.Value = "wrong"
+	require.Equal(t, http.StatusBadRequest, p.request(http.MethodGet, callbackPath, nil, &wrongBrowser, "", "").Code)
+	callback := p.request(http.MethodGet, callbackPath, nil, browserCookie, "", "")
 	require.Equal(t, http.StatusFound, callback.Code, callback.Body.String())
-	require.Equal(t, http.StatusBadRequest, p.request(http.MethodGet, callbackPath, nil, stateCookie, "", "").Code)
+	require.Equal(t, http.StatusBadRequest, p.request(http.MethodGet, callbackPath, nil, browserCookie, "", "").Code)
 	cookies := callback.Result().Cookies()
 	var session *http.Cookie
 	for _, cookie := range cookies {
@@ -313,6 +334,94 @@ func TestOIDCFlowAndRefresh(t *testing.T) {
 	require.Contains(t, login.Header().Get("Location"), "google.example/authorize")
 }
 
+func TestAuthorizationRequestRequiresStartingBrowser(t *testing.T) {
+	p := newPrototype(t)
+	_, session, _ := p.signIn(t)
+	victimBrowser := p.browserCookie
+
+	// A second browser starts an app sign-in; the signed-in browser cannot
+	// complete that pending request with its SSO session.
+	p.browserCookie = nil
+	loginPath, _ := p.authorize(t)
+	otherBrowser := p.browserCookie
+	login := p.requestWithBrowser(http.MethodGet, loginPath, nil, session, victimBrowser, "", "")
+	require.Equal(t, http.StatusBadRequest, login.Code)
+	requestID, err := url.Parse(loginPath)
+	require.NoError(t, err)
+	var done bool
+	require.NoError(t, p.db.Raw("SELECT done FROM oidc_auth_requests WHERE id = ?", requestID.Query().Get("authRequestID")).Scan(&done).Error)
+	require.False(t, done)
+
+	// The originating browser can still continue its own request.
+	login = p.requestWithBrowser(http.MethodGet, loginPath, nil, nil, otherBrowser, "", "")
+	require.Equal(t, http.StatusFound, login.Code)
+	require.Contains(t, login.Header().Get("Location"), "google.example/authorize")
+}
+
+func TestAuthorizationCallbacksRequireStartingBrowser(t *testing.T) {
+	p := newPrototype(t)
+	state, browserCookie, _ := p.beginGoogle(t)
+	browser := p.browserCookie
+	callbackPath := "/auth/callback?state=" + url.QueryEscape(state) + "&code=valid"
+
+	missing := p.requestWithBrowser(http.MethodGet, callbackPath, nil, nil, nil, "", "")
+	require.Equal(t, http.StatusBadRequest, missing.Code)
+	wrong := *browser
+	wrong.Value = "wrong-browser"
+	malformed := p.requestWithBrowser(http.MethodGet, callbackPath, nil, nil, &wrong, "", "")
+	require.Equal(t, http.StatusBadRequest, malformed.Code)
+	wrongValue, err := oidcprovider.NewBrowserBinding()
+	require.NoError(t, err)
+	wrong.Value = wrongValue
+	mismatch := p.requestWithBrowser(http.MethodGet, callbackPath, nil, nil, &wrong, "", "")
+	require.Equal(t, http.StatusBadRequest, mismatch.Code)
+	require.Zero(t, p.google.calls, "Google code must not be exchanged for another browser")
+
+	callback := p.request(http.MethodGet, callbackPath, nil, browserCookie, "", "")
+	require.Equal(t, http.StatusFound, callback.Code)
+	finishPath := pathFromLocation(t, callback)
+	require.Equal(t, http.StatusBadRequest, p.requestWithBrowser(http.MethodGet, finishPath, nil, nil, nil, "", "").Code)
+	require.Equal(t, http.StatusBadRequest, p.requestWithBrowser(http.MethodGet, finishPath, nil, nil, &wrong, "", "").Code)
+	issued := p.request(http.MethodGet, finishPath, nil, nil, "", "")
+	require.Equal(t, http.StatusFound, issued.Code)
+	require.NotEmpty(t, issued.Header().Get("Location"))
+}
+
+func TestTwoTabsKeepTheirOwnBrowserBindings(t *testing.T) {
+	p := newPrototype(t)
+	_, session, _ := p.signIn(t)
+	first, _ := p.authorize(t)
+	firstBrowser := p.browserCookie
+	second, _ := p.authorize(t)
+	secondBrowser := p.browserCookie
+	require.NotEqual(t, firstBrowser.Name, secondBrowser.Name)
+	for _, tab := range []struct {
+		path    string
+		browser *http.Cookie
+	}{{first, firstBrowser}, {second, secondBrowser}} {
+		login := p.requestWithBrowser(http.MethodGet, tab.path, nil, session, tab.browser, "", "")
+		require.Equal(t, http.StatusFound, login.Code)
+		issued := p.requestWithBrowser(http.MethodGet, pathFromLocation(t, login), nil, nil, tab.browser, "", "")
+		require.Equal(t, http.StatusFound, issued.Code)
+	}
+}
+
+func TestTwoTabsCanFinishGoogleSignIn(t *testing.T) {
+	p := newPrototype(t)
+	firstState, firstBrowser, _ := p.beginGoogle(t)
+	secondState, secondBrowser, _ := p.beginGoogle(t)
+	require.NotEqual(t, firstBrowser.Name, secondBrowser.Name)
+	for _, tab := range []struct {
+		state   string
+		browser *http.Cookie
+	}{{firstState, firstBrowser}, {secondState, secondBrowser}} {
+		callback := p.requestWithBrowser(http.MethodGet, "/auth/callback?state="+url.QueryEscape(tab.state)+"&code=valid", nil, nil, tab.browser, "", "")
+		require.Equal(t, http.StatusFound, callback.Code)
+		issued := p.requestWithBrowser(http.MethodGet, pathFromLocation(t, callback), nil, nil, tab.browser, "", "")
+		require.Equal(t, http.StatusFound, issued.Code)
+	}
+}
+
 func TestAuthorizationRejectsWrongPKCEVerifier(t *testing.T) {
 	p := newPrototype(t)
 	code, _, verifier := p.signIn(t)
@@ -371,12 +480,26 @@ func TestSignInFailureLogsContainOnlyCategories(t *testing.T) {
 		requireFailureCategory(t, logs, "authorization_pkce_required", "challenge-sentinel")
 	})
 
-	t.Run("Google state mismatch", func(t *testing.T) {
+	t.Run("Google callback cookie missing", func(t *testing.T) {
 		logs := captureSafeLogs(t)
 		p := newPrototype(t)
 		state, _, _ := p.beginGoogle(t)
 		logs.Reset()
-		w := p.request(http.MethodGet, "/auth/callback?state="+url.QueryEscape(state)+"&code=code-sentinel", nil, nil, "", "")
+		w := p.requestWithBrowser(http.MethodGet, "/auth/callback?state="+url.QueryEscape(state)+"&code=code-sentinel", nil, nil, nil, "", "")
+		require.Equal(t, http.StatusBadRequest, w.Code)
+		requireFailureCategory(t, logs, "google_cookie_missing", "code-sentinel", state)
+	})
+
+	t.Run("Google state mismatch", func(t *testing.T) {
+		logs := captureSafeLogs(t)
+		p := newPrototype(t)
+		state, browser, _ := p.beginGoogle(t)
+		wrong := *browser
+		otherValue, err := oidcprovider.NewBrowserBinding()
+		require.NoError(t, err)
+		wrong.Value = otherValue
+		logs.Reset()
+		w := p.requestWithBrowser(http.MethodGet, "/auth/callback?state="+url.QueryEscape(state)+"&code=code-sentinel", nil, nil, &wrong, "", "")
 		require.Equal(t, http.StatusBadRequest, w.Code)
 		requireFailureCategory(t, logs, "google_state_mismatch", "code-sentinel", state)
 	})

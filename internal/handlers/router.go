@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/kthaisociety/identity-service/internal/googleauth"
 	"github.com/kthaisociety/identity-service/internal/oidcprovider"
 )
@@ -55,18 +56,50 @@ func NewPublicRouter(d Deps) *gin.Engine {
 				c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "PKCE S256 required"})
 				return
 			}
+			// A separate cookie name for each request lets two first-time tabs
+			// keep their bindings even when both /authorize calls arrive at once.
+			requestID := uuid.NewString()
+			browserValue, err := oidcprovider.NewBrowserBinding()
+			if err != nil {
+				reject(c, http.StatusInternalServerError, "authorization_browser_failed")
+				return
+			}
+			ctx := oidcprovider.WithBrowserBinding(c.Request.Context(), browserValue)
+			ctx = oidcprovider.WithAuthRequestID(ctx, requestID)
+			ctx = oidcprovider.WithAuthRequestCookieHooks(ctx, oidcprovider.AuthRequestCookieHooks{
+				Created: func() {
+					http.SetCookie(c.Writer, identityCookie(d, browserCookieName(d, requestID), browserValue, "/", int(oidcprovider.AuthRequestLifetime.Seconds())))
+				},
+			})
+			c.Request = c.Request.WithContext(ctx)
 			// ZITADEL validates and stores the app request through AuthStore. On
 			// success it redirects the browser to /login?authRequestID=...
 			d.Provider.ServeHTTP(c.Writer, c.Request)
 		})
 		r.GET("/login", login(d))
 		r.GET("/auth/callback", googleCallback(d))
+		r.GET("/authorize/callback", func(c *gin.Context) {
+			id := c.Query("id")
+			browserValue, _ := c.Cookie(browserCookieName(d, id))
+			if _, err := d.AuthStore.AuthRequestForBrowser(c.Request.Context(), id, browserValue); err != nil {
+				reject(c, http.StatusBadRequest, "authorization_browser_mismatch")
+				return
+			}
+			ctx := oidcprovider.WithBrowserBinding(c.Request.Context(), browserValue)
+			ctx = oidcprovider.WithAuthRequestCookieHooks(ctx, oidcprovider.AuthRequestCookieHooks{
+				CodeSaved: func() {
+					http.SetCookie(c.Writer, identityCookie(d, browserCookieName(d, id), "", "/", -1))
+				},
+			})
+			c.Request = c.Request.WithContext(ctx)
+			d.Provider.ServeHTTP(c.Writer, c.Request)
+		})
 
 		r.GET("/end_session", endSession(d))
 		// These OIDC routes need no identity handler logic; Gin passes each
 		// request to the provider's handler for that path.
 		for _, path := range []string{
-			"/.well-known/openid-configuration", "/authorize/callback", "/oauth/token",
+			"/.well-known/openid-configuration", "/oauth/token",
 			"/keys", "/userinfo", "/oauth/introspect", "/revoke",
 		} {
 			r.Any(path, gin.WrapH(d.Provider))
@@ -79,9 +112,17 @@ func NewPublicRouter(d Deps) *gin.Engine {
 
 const (
 	sessionCookie      = "identity_session"
-	googleStateCookie  = "identity_google_state"
+	authBrowserCookie  = "identity_auth_browser"
 	failureCategoryKey = "failure_category"
 )
+
+func browserCookieName(d Deps, requestID string) string {
+	name := authBrowserCookie + "_" + requestID
+	if strings.HasPrefix(d.Issuer, "https://") {
+		return "__Host-" + name
+	}
+	return name
+}
 
 // markFailure records only a fixed category. The middleware emits the event
 // after the handler has chosen its response status.
@@ -156,8 +197,8 @@ func providerFailureCategory(route string) string {
 	}
 }
 
-// identityCookie applies the browser cookie settings shared by SSO and Google
-// state; production cookies are Secure when the configured issuer uses HTTPS.
+// identityCookie applies shared settings to the SSO session and per-request
+// sign-in cookies. HTTPS issuers make these cookies Secure.
 func identityCookie(d Deps, name, value, path string, maxAge int) *http.Cookie {
 	return &http.Cookie{
 		Name: name, Value: value, Path: path, MaxAge: maxAge,
@@ -174,12 +215,14 @@ func identityCookie(d Deps, name, value, path string, maxAge int) *http.Cookie {
 func login(d Deps) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		id := c.Query("authRequestID")
-		request, err := d.AuthStore.AuthRequestByID(c.Request.Context(), id)
+		browserValue, _ := c.Cookie(browserCookieName(d, id))
+		request, err := d.AuthStore.AuthRequestForBrowser(c.Request.Context(), id, browserValue)
 		if err != nil || request.Done() {
 			markFailure(c, "login_request_invalid")
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "invalid login request"})
 			return
 		}
+		c.Request = c.Request.WithContext(oidcprovider.WithBrowserBinding(c.Request.Context(), browserValue))
 		if cookie, err := c.Cookie(sessionCookie); err == nil {
 			if userID, authTime, err := d.AuthStore.SessionUser(c.Request.Context(), cookie); err == nil {
 				if err := d.AuthStore.CompleteSessionLogin(c.Request.Context(), id, userID, authTime); err != nil {
@@ -196,7 +239,6 @@ func login(d Deps) gin.HandlerFunc {
 			reject(c, http.StatusInternalServerError, "google_state_store_failed")
 			return
 		}
-		http.SetCookie(c.Writer, identityCookie(d, googleStateCookie, state, "/auth/callback", int(oidcprovider.AuthRequestLifetime.Seconds())))
 		c.Redirect(http.StatusFound, d.Google.AuthURL(state))
 	}
 }
@@ -213,16 +255,21 @@ func googleCallback(d Deps) gin.HandlerFunc {
 			reject(c, http.StatusBadRequest, "google_callback_invalid")
 			return
 		}
-		browserState, err := c.Cookie(googleStateCookie)
-		if err != nil || subtle.ConstantTimeCompare([]byte(browserState), []byte(state)) != 1 {
-			reject(c, http.StatusBadRequest, "google_state_mismatch")
-			return
-		}
-		http.SetCookie(c.Writer, identityCookie(d, googleStateCookie, "", "/auth/callback", -1))
-		if _, err := d.AuthStore.RequestIDForGoogleState(c.Request.Context(), state); err != nil {
+		id, err := d.AuthStore.AuthRequestIDByGoogleState(c.Request.Context(), state)
+		if err != nil {
 			reject(c, http.StatusBadRequest, "google_state_invalid")
 			return
 		}
+		browserValue, err := c.Cookie(browserCookieName(d, id))
+		if err != nil || browserValue == "" {
+			reject(c, http.StatusBadRequest, "google_cookie_missing")
+			return
+		}
+		if _, err := d.AuthStore.RequestIDForGoogleState(c.Request.Context(), state, browserValue); err != nil {
+			reject(c, http.StatusBadRequest, "google_state_mismatch")
+			return
+		}
+		c.Request = c.Request.WithContext(oidcprovider.WithBrowserBinding(c.Request.Context(), browserValue))
 		// This is Google's code; ZITADEL creates the separate app code later.
 		identity, err := d.Google.Exchange(c.Request.Context(), code)
 		if err != nil {
@@ -261,7 +308,19 @@ func endSession(d Deps) gin.HandlerFunc {
 			_ = d.AuthStore.EndSession(c.Request.Context(), value)
 		}
 		http.SetCookie(c.Writer, identityCookie(d, sessionCookie, "", "/", -1))
-		http.SetCookie(c.Writer, identityCookie(d, googleStateCookie, "", "/auth/callback", -1))
+		// Clear every pending sign-in from this browser, including other tabs.
+		// Request IDs are UUIDs, so only clear names we could have issued.
+		prefix := browserCookieName(d, "")
+		for _, cookie := range c.Request.Cookies() {
+			id, ok := strings.CutPrefix(cookie.Name, prefix)
+			if !ok {
+				continue
+			}
+			parsed, err := uuid.Parse(id)
+			if err == nil && parsed.String() == id {
+				http.SetCookie(c.Writer, identityCookie(d, cookie.Name, "", "/", -1))
+			}
+		}
 		d.Provider.ServeHTTP(c.Writer, c.Request)
 	}
 }

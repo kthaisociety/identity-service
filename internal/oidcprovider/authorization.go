@@ -2,6 +2,7 @@ package oidcprovider
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"strings"
 	"time"
@@ -12,27 +13,107 @@ import (
 	"gorm.io/gorm"
 )
 
+type browserBindingKey struct{}
+type authRequestIDKey struct{}
+type authRequestCookieHooksKey struct{}
+
+// AuthRequestCookieHooks lets the HTTP layer set and clear the request cookie
+// when ZITADEL's storage hooks confirm those lifecycle steps succeeded.
+type AuthRequestCookieHooks struct {
+	Created   func()
+	CodeSaved func()
+}
+
+func WithAuthRequestCookieHooks(ctx context.Context, hooks AuthRequestCookieHooks) context.Context {
+	return context.WithValue(ctx, authRequestCookieHooksKey{}, hooks)
+}
+
+func authRequestCookieHooks(ctx context.Context) AuthRequestCookieHooks {
+	hooks, _ := ctx.Value(authRequestCookieHooksKey{}).(AuthRequestCookieHooks)
+	return hooks
+}
+
+// NewBrowserBinding makes the opaque value kept in the browser during sign-in.
+func NewBrowserBinding() (string, error) { return randomString() }
+
+// ValidBrowserBinding accepts only the canonical form emitted by NewBrowserBinding.
+// Its shape does not prove who set the cookie; the stored hash provides the match.
+func ValidBrowserBinding(value string) bool {
+	if len(value) != base64.RawURLEncoding.EncodedLen(randomStringBytes) {
+		return false
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(value)
+	return err == nil && len(decoded) == randomStringBytes && base64.RawURLEncoding.EncodeToString(decoded) == value
+}
+
+// WithBrowserBinding passes only the cookie hash to the provider's storage hook.
+func WithBrowserBinding(ctx context.Context, value string) context.Context {
+	if !ValidBrowserBinding(value) {
+		// Do not retain an earlier binding if a caller supplies a bad cookie.
+		return context.WithValue(ctx, browserBindingKey{}, "")
+	}
+	return context.WithValue(ctx, browserBindingKey{}, hash(value))
+}
+
+// WithAuthRequestID lets /authorize name its cookie before ZITADEL stores the request.
+func WithAuthRequestID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, authRequestIDKey{}, id)
+}
+
+func browserHashFromContext(ctx context.Context) (string, error) {
+	value, ok := ctx.Value(browserBindingKey{}).(string)
+	if !ok || value == "" {
+		return "", errors.New("authorization browser binding missing")
+	}
+	return value, nil
+}
+
 // CreateAuthRequest implements op.AuthStorage for /authorize. ZITADEL has
 // validated the app request; this inserts its pending state before /login.
 func (s *Store) CreateAuthRequest(ctx context.Context, incoming *oidc.AuthRequest, userID string) (op.AuthRequest, error) {
+	browserHash, err := browserHashFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	id, _ := ctx.Value(authRequestIDKey{}).(string)
+	if id == "" {
+		id = uuid.NewString()
+	}
 	a := &authRequest{
-		ID: uuid.NewString(), ClientID: incoming.ClientID, RedirectURI: incoming.RedirectURI,
+		ID: id, ClientID: incoming.ClientID, RedirectURI: incoming.RedirectURI,
 		State: incoming.State, Nonce: incoming.Nonce, Scopes: strings.Join(incoming.Scopes, " "),
 		ResponseType: string(incoming.ResponseType), ResponseMode: string(incoming.ResponseMode),
 		CodeChallenge: incoming.CodeChallenge, CodeChallengeMethod: string(incoming.CodeChallengeMethod),
-		UserID: userID, CreatedAt: time.Now().UTC(),
+		UserID: userID, BrowserHash: browserHash, CreatedAt: time.Now().UTC(),
 	}
 	if err := s.db.WithContext(ctx).Create(a).Error; err != nil {
 		return nil, err
 	}
+	if notify := authRequestCookieHooks(ctx).Created; notify != nil {
+		notify()
+	}
 	return a, nil
 }
 
-// AuthRequestByID loads a pending or completed request while it is still fresh.
-// Our /login handler and ZITADEL's /authorize/callback both call it.
-func (s *Store) AuthRequestByID(ctx context.Context, id string) (op.AuthRequest, error) {
+// AuthRequestForBrowser loads a request only for the browser that started it.
+func (s *Store) AuthRequestForBrowser(ctx context.Context, id, value string) (op.AuthRequest, error) {
+	if !ValidBrowserBinding(value) {
+		return nil, gorm.ErrRecordNotFound
+	}
 	var a authRequest
-	err := s.db.WithContext(ctx).First(&a, "id = ? AND created_at > ?", id, time.Now().UTC().Add(-AuthRequestLifetime)).Error
+	err := s.db.WithContext(ctx).First(&a, "id = ? AND browser_hash = ? AND created_at > ?", id, hash(value), time.Now().UTC().Add(-AuthRequestLifetime)).Error
+	return &a, err
+}
+
+// AuthRequestByID loads a browser-bound request for ZITADEL's
+// /authorize/callback while it is still fresh.
+func (s *Store) AuthRequestByID(ctx context.Context, id string) (op.AuthRequest, error) {
+	browserHash, err := browserHashFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var a authRequest
+	err = s.db.WithContext(ctx).First(&a, "id = ? AND browser_hash = ? AND created_at > ?", id, browserHash, time.Now().UTC().Add(-AuthRequestLifetime)).Error
 	return &a, err
 }
 
@@ -62,15 +143,22 @@ func (s *Store) AuthRequestByCode(ctx context.Context, code string) (op.AuthRequ
 // SaveAuthCode is called by ZITADEL at /authorize/callback after login. It
 // stores the one-use code's hash and expiry on the completed request row.
 func (s *Store) SaveAuthCode(ctx context.Context, id, code string) error {
+	browserHash, err := browserHashFromContext(ctx)
+	if err != nil {
+		return err
+	}
 	expires := time.Now().UTC().Add(codeLifetime)
 	result := s.db.WithContext(ctx).Model(&authRequest{}).
-		Where("id = ? AND done = true AND created_at > ? AND code_hash IS NULL", id, time.Now().UTC().Add(-AuthRequestLifetime)).
+		Where("id = ? AND browser_hash = ? AND done = true AND created_at > ? AND code_hash IS NULL", id, browserHash, time.Now().UTC().Add(-AuthRequestLifetime)).
 		Updates(map[string]any{"code_hash": hash(code), "code_expires_at": expires})
 	if result.Error != nil {
 		return result.Error
 	}
 	if result.RowsAffected != 1 {
 		return errors.New("authorization request is not ready")
+	}
+	if notify := authRequestCookieHooks(ctx).CodeSaved; notify != nil {
+		notify()
 	}
 	return nil
 }
@@ -84,13 +172,17 @@ func (s *Store) DeleteAuthRequest(ctx context.Context, id string) error {
 // BeginGoogle is our /login step when there is no identity session. It saves
 // a state hash on the pending request and returns the value for the browser.
 func (s *Store) BeginGoogle(ctx context.Context, requestID string) (string, error) {
+	browserHash, err := browserHashFromContext(ctx)
+	if err != nil {
+		return "", err
+	}
 	state, err := randomString()
 	if err != nil {
 		return "", err
 	}
 	stateHash := hash(state)
 	result := s.db.WithContext(ctx).Model(&authRequest{}).
-		Where("id = ? AND done = false AND created_at > ?", requestID, time.Now().UTC().Add(-AuthRequestLifetime)).
+		Where("id = ? AND browser_hash = ? AND done = false AND created_at > ?", requestID, browserHash, time.Now().UTC().Add(-AuthRequestLifetime)).
 		Update("google_state_hash", stateHash)
 	if result.Error != nil {
 		return "", result.Error
@@ -104,15 +196,19 @@ func (s *Store) BeginGoogle(ctx context.Context, requestID string) (string, erro
 // CompleteGoogle finishes /auth/callback by consuming the Google state and
 // attaching the verified user and authentication time to the pending request.
 func (s *Store) CompleteGoogle(ctx context.Context, state, userID string) (string, time.Time, error) {
+	browserHash, err := browserHashFromContext(ctx)
+	if err != nil {
+		return "", time.Time{}, err
+	}
 	var requestID string
 	var authTime time.Time
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var a authRequest
-		if err := tx.Where("google_state_hash = ? AND created_at > ? AND done = false", hash(state), time.Now().UTC().Add(-AuthRequestLifetime)).First(&a).Error; err != nil {
+		if err := tx.Where("google_state_hash = ? AND browser_hash = ? AND created_at > ? AND done = false", hash(state), browserHash, time.Now().UTC().Add(-AuthRequestLifetime)).First(&a).Error; err != nil {
 			return err
 		}
 		now := time.Now().UTC()
-		result := tx.Model(&authRequest{}).Where("id = ? AND google_state_hash = ? AND done = false", a.ID, hash(state)).
+		result := tx.Model(&authRequest{}).Where("id = ? AND google_state_hash = ? AND browser_hash = ? AND done = false", a.ID, hash(state), browserHash).
 			Updates(map[string]any{"google_state_hash": nil, "user_id": userID, "auth_time": now, "done": true})
 		if result.Error != nil {
 			return result.Error
@@ -127,20 +223,36 @@ func (s *Store) CompleteGoogle(ctx context.Context, state, userID string) (strin
 	return requestID, authTime, err
 }
 
+// AuthRequestIDByGoogleState is a read-only lookup used to choose the
+// request-specific cookie at Google's callback. The bound lookup follows it.
+func (s *Store) AuthRequestIDByGoogleState(ctx context.Context, state string) (string, error) {
+	var a authRequest
+	err := s.db.WithContext(ctx).Select("id").First(&a,
+		"google_state_hash = ? AND created_at > ? AND done = false", hash(state), time.Now().UTC().Add(-AuthRequestLifetime)).Error
+	return a.ID, err
+}
+
 // RequestIDForGoogleState checks that Google's returned state still belongs to
 // an unfinished request before /auth/callback exchanges Google's code.
-func (s *Store) RequestIDForGoogleState(ctx context.Context, state string) (string, error) {
+func (s *Store) RequestIDForGoogleState(ctx context.Context, state, browserValue string) (string, error) {
+	if !ValidBrowserBinding(browserValue) {
+		return "", gorm.ErrRecordNotFound
+	}
 	var a authRequest
-	err := s.db.WithContext(ctx).First(&a, "google_state_hash = ? AND created_at > ? AND done = false", hash(state), time.Now().UTC().Add(-AuthRequestLifetime)).Error
+	err := s.db.WithContext(ctx).First(&a, "google_state_hash = ? AND browser_hash = ? AND created_at > ? AND done = false", hash(state), hash(browserValue), time.Now().UTC().Add(-AuthRequestLifetime)).Error
 	return a.ID, err
 }
 
 // CompleteSessionLogin finishes /login without Google when the browser already
 // has an identity session, preserving its original authentication time.
 func (s *Store) CompleteSessionLogin(ctx context.Context, requestID, userID string, authTime time.Time) error {
+	browserHash, err := browserHashFromContext(ctx)
+	if err != nil {
+		return err
+	}
 	now := time.Now().UTC()
 	result := s.db.WithContext(ctx).Model(&authRequest{}).
-		Where("id = ? AND done = false AND created_at > ?", requestID, now.Add(-AuthRequestLifetime)).
+		Where("id = ? AND browser_hash = ? AND done = false AND created_at > ?", requestID, browserHash, now.Add(-AuthRequestLifetime)).
 		Updates(map[string]any{"user_id": userID, "auth_time": authTime, "done": true})
 	if result.Error != nil {
 		return result.Error
