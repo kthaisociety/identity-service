@@ -38,12 +38,13 @@ func TestMalformedBrowserBindingCannotReachStore(t *testing.T) {
 	s := testStore(t)
 	valid := mustBrowserBinding(t)
 	ctx := WithBrowserBinding(context.Background(), valid)
-	request, err := s.CreateAuthRequest(ctx, &oidc.AuthRequest{ClientID: "app"}, "")
+	incoming := &oidc.AuthRequest{ClientID: "app", CodeChallenge: "challenge", CodeChallengeMethod: oidc.CodeChallengeMethodS256}
+	request, err := s.CreateAuthRequest(ctx, incoming, "")
 	require.NoError(t, err)
 
-	_, err = s.CreateAuthRequest(WithBrowserBinding(context.Background(), "banana"), &oidc.AuthRequest{ClientID: "app"}, "")
+	_, err = s.CreateAuthRequest(WithBrowserBinding(context.Background(), "banana"), incoming, "")
 	require.Error(t, err)
-	_, err = s.CreateAuthRequest(WithBrowserBinding(ctx, "banana"), &oidc.AuthRequest{ClientID: "app"}, "")
+	_, err = s.CreateAuthRequest(WithBrowserBinding(ctx, "banana"), incoming, "")
 	require.Error(t, err, "an invalid value must replace any earlier context binding")
 	_, err = s.AuthRequestForBrowser(context.Background(), request.GetID(), "banana")
 	require.Error(t, err)
