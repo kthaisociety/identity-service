@@ -26,6 +26,7 @@ import (
 	"github.com/kthaisociety/identity-service/internal/googleauth"
 	"github.com/kthaisociety/identity-service/internal/oidcprovider"
 	"github.com/stretchr/testify/require"
+	"github.com/zitadel/oidc/v3/pkg/oidc"
 	"github.com/zitadel/oidc/v3/pkg/op"
 	"gorm.io/gorm"
 )
@@ -53,6 +54,8 @@ func (g *fakeGoogle) Exchange(_ context.Context, code string) (googleauth.Identi
 
 type prototype struct {
 	router        http.Handler
+	provider      *op.Provider
+	issuer        string
 	db            *gorm.DB
 	google        *fakeGoogle
 	signingKey    *rsa.PrivateKey
@@ -93,7 +96,7 @@ func newPrototypeWithIssuer(t *testing.T, issuer string) *prototype {
 		PingDB: func(context.Context) error { return nil }, Provider: provider, AuthStore: store,
 		Google: google, AuthCallbackURL: op.AuthCallbackURL(provider), Issuer: cfg.Issuer,
 	})
-	return &prototype{router: router, db: db, google: google, signingKey: key}
+	return &prototype{router: router, provider: provider, issuer: issuer, db: db, google: google, signingKey: key}
 }
 
 func ginTestMode() { gin.SetMode(gin.TestMode) }
@@ -511,7 +514,7 @@ func expiredIDTokenHint(t *testing.T, p *prototype, raw string) string {
 	require.NoError(t, err)
 	var claims map[string]any
 	require.NoError(t, parsed.Claims(&p.signingKey.PublicKey, &claims))
-	claims["exp"] = time.Now().Add(-time.Minute).Unix()
+	claims["exp"] = time.Now().Add(-10 * time.Minute).Unix()
 	signer, err := jose.NewSigner(jose.SigningKey{
 		Algorithm: jose.RS256,
 		Key:       jose.JSONWebKey{Key: p.signingKey, KeyID: parsed.Headers[0].KeyID},
@@ -526,6 +529,12 @@ func TestExpiredIDTokenHintWithLiveSessionLogsOut(t *testing.T) {
 	p := newPrototype(t)
 	cookie, tokens := p.issueLogoutTokens(t)
 	expired := expiredIDTokenHint(t, p, tokens.IDToken)
+	ctx := op.ContextWithIssuer(context.Background(), p.issuer)
+	claims, err := op.VerifyIDTokenHint[*oidc.IDTokenClaims](ctx, expired, p.provider.IDTokenHintVerifier(ctx))
+	var expiredErr op.IDTokenHintExpiredError
+	require.ErrorAs(t, err, &expiredErr, "the hint must be classified as expired before testing logout")
+	require.NotNil(t, claims)
+	require.NotEmpty(t, claims.GetSubject())
 	response := p.request(http.MethodGet, "/end_session?id_token_hint="+url.QueryEscape(expired), nil, cookie, "", "")
 	require.Equal(t, http.StatusFound, response.Code, response.Body.String())
 	var sessions, refreshes int64
