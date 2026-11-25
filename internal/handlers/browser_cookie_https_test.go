@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
@@ -11,7 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestHTTPSBrowserBindingCookieCompletesSignIn(t *testing.T) {
+func TestHTTPSBrowserBindingCookieSignInAndLogout(t *testing.T) {
 	p := newPrototypeWithIssuer(t, "https://identity.example")
 	origin, err := url.Parse("https://identity.example/")
 	require.NoError(t, err)
@@ -22,6 +23,7 @@ func TestHTTPSBrowserBindingCookieCompletesSignIn(t *testing.T) {
 		requestURL, err := origin.Parse(path)
 		require.NoError(t, err)
 		req := httptest.NewRequest(http.MethodGet, requestURL.String(), nil)
+		req.Header.Set("Sec-Fetch-Site", "same-site")
 		for _, cookie := range jar.Cookies(requestURL) {
 			req.AddCookie(cookie)
 		}
@@ -78,5 +80,45 @@ func TestHTTPSBrowserBindingCookieCompletesSignIn(t *testing.T) {
 	require.Less(t, cleared.MaxAge, 0)
 	for _, cookie := range jar.Cookies(origin) {
 		require.NotEqual(t, binding.Name, cookie.Name)
+	}
+
+	// Exchange the real authorization code so logout uses a genuine ID token.
+	appURL, err := url.Parse(finish.Header().Get("Location"))
+	require.NoError(t, err)
+	issued := p.exchange(appURL.Query().Get("code"), "a-very-long-pkce-verifier-created-by-the-client", "app", "secret", "https://app.example/callback")
+	require.Equal(t, http.StatusOK, issued.Code, issued.Body.String())
+	var tokens logoutTokens
+	require.NoError(t, json.Unmarshal(issued.Body.Bytes(), &tokens))
+
+	first := get(authorizePathForCookieTest("app", "https://app.example/callback"))
+	second := get(authorizePathForCookieTest("app", "https://app.example/callback"))
+	require.Equal(t, http.StatusFound, first.Code)
+	require.Equal(t, http.StatusFound, second.Code)
+	var pending []string
+	for _, cookie := range jar.Cookies(origin) {
+		if strings.HasPrefix(cookie.Name, "__Host-"+authBrowserCookie+"_") {
+			pending = append(pending, cookie.Name)
+		}
+	}
+	require.Len(t, pending, 2)
+
+	rejected := get("/end_session")
+	require.Equal(t, http.StatusBadRequest, rejected.Code)
+	require.Empty(t, rejected.Result().Cookies())
+	logout := get("/end_session?id_token_hint=" + url.QueryEscape(tokens.IDToken))
+	require.Equal(t, http.StatusFound, logout.Code, logout.Body.String())
+	var clearedPending []string
+	for _, cookie := range logout.Result().Cookies() {
+		if strings.HasPrefix(cookie.Name, "__Host-"+authBrowserCookie+"_") {
+			require.True(t, cookie.Secure)
+			require.Equal(t, "/", cookie.Path)
+			require.Empty(t, cookie.Domain)
+			require.Less(t, cookie.MaxAge, 0)
+			clearedPending = append(clearedPending, cookie.Name)
+		}
+	}
+	require.ElementsMatch(t, pending, clearedPending)
+	for _, cookie := range jar.Cookies(origin) {
+		require.False(t, strings.HasPrefix(cookie.Name, "__Host-"+authBrowserCookie+"_"))
 	}
 }
